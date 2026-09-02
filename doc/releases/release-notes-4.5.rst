@@ -2291,6 +2291,11 @@ Other notable changes
     up, and waits about ten seconds before restarting after a refused request
     or a declined address.
 
+* Espressif
+
+  * Added experimental SMP support for the ESP32-P4 dual-core HP processor,
+    enabled with :kconfig:option:`CONFIG_SMP`.
+
 * Wi-Fi
 
   * Removed the ``samples/net/wifi/test_certs/rsa2k`` enterprise test
