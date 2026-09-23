@@ -15,8 +15,13 @@
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/ethernet/eth_nxp_enet.h>
+#include <zephyr/logging/log.h>
+
+#include <math.h>
 
 #include <fsl_enet.h>
+
+LOG_MODULE_REGISTER(ptp_clock_nxp_enet, LOG_LEVEL_INF);
 
 struct ptp_clock_nxp_enet_config {
 	const struct pinctrl_dev_config *pincfg;
@@ -89,59 +94,143 @@ static int ptp_clock_nxp_enet_adjust(const struct device *dev,
 
 }
 
+static uint32_t ptp_clock_nxp_enet_gcd(uint32_t a, uint32_t b)
+{
+	while (b != 0) {
+		uint32_t t = b;
+
+		b = a % b;
+		a = t;
+	}
+
+	return a;
+}
+
+/*
+ * ENET_Ptp1588StartTimer() sets ATINC.INC to floor(NSEC_PER_SEC / clk_hz),
+ * truncating any fractional ns/tick (e.g. 24 MHz -> 41.667 ns/tick truncates
+ * to 41, a static ~1.6% slow bias). The original upstream implementation of
+ * this function only ever tried corr = hw_inc +/- 1 relative to that
+ * truncated integer, so it could only reach +/-1/(2*hw_inc) (~1.22% here) --
+ * smaller than the 1.6% truncation bias, so it either silently rejected
+ * every correction (-EINVAL, discarded by the PTP servo caller) or, once the
+ * offset was small enough to request a ratio inside that range, applied a
+ * *worse* approximation (INC_CORR=42/ATCOR=2, average 41.5 ns/tick) that
+ * clobbered any better-informed correction already in the registers. Either
+ * way the true ~1.6% bias was never actually cancelled: confirmed on
+ * hardware -- the local/grandmaster 1PPS edges drifted at the same rate
+ * whether the exact correction below was in place or the servo's coarse one
+ * had overwritten it.
+ *
+ * Fix: always compute the correction against the *exact* target rate
+ * (NSEC_PER_SEC / clk_hz as a real number, not its integer floor) with the
+ * requested servo ratio applied on top, then search for the (corr, period)
+ * pair -- bounded by the 7-bit INC_CORR field -- that best approximates it.
+ * This bakes the truncation-bias cancellation into every call instead of a
+ * separate one-time fix the servo can throw away.
+ */
 static int ptp_clock_nxp_enet_rate_adjust(const struct device *dev,
 					double ratio)
 {
 	const struct ptp_clock_nxp_enet_config *config = dev->config;
 	struct ptp_clock_nxp_enet_data *data = dev->data;
-	int corr;
-	int32_t mul;
-	double val;
-	uint32_t enet_ref_pll_rate;
+	uint32_t clk_hz;
+	uint32_t hw_inc;
+	uint32_t corr_max = ENET_ATINC_INC_CORR_MASK >> ENET_ATINC_INC_CORR_SHIFT;
+	double target;
+	double delta;
+	double best_err = -1.0;
+	uint32_t best_period = 0;
+	int32_t best_corr = 0;
+	uint32_t period;
 
 	(void) clock_control_get_rate(config->clock_dev, config->clock_subsys,
-				&enet_ref_pll_rate);
-	int hw_inc = NSEC_PER_SEC / enet_ref_pll_rate;
+				&clk_hz);
+
+	hw_inc = NSEC_PER_SEC / clk_hz;
+	target = (double)NSEC_PER_SEC / (double)clk_hz;
 
 	/* No change needed. */
 	if ((ratio > 1.0 && ratio - 1.0 < 0.00000001) ||
 	   (ratio < 1.0 && 1.0 - ratio < 0.00000001)) {
-		return 0;
+		ratio = 1.0;
 	}
 
-	/* Limit possible ratio. */
-	if ((ratio > 1.0 + 1.0/(2 * hw_inc)) ||
-			(ratio < 1.0 - 1.0/(2 * hw_inc))) {
-		return -EINVAL;
+	/* Extra ns/tick needed, on top of the truncated INC, to realize the
+	 * exact target rate times the servo's requested ratio.
+	 */
+	delta = target * ratio - (double)hw_inc;
+
+	for (period = 1; period <= corr_max; period++) {
+		int32_t corr = (int32_t)hw_inc +
+			(int32_t)floor(delta * period + 0.5);
+		double err;
+
+		if (corr < 0 || corr > (int32_t)corr_max) {
+			continue;
+		}
+
+		err = fabs((double)(corr - (int32_t)hw_inc) / period - delta);
+
+		if (best_period == 0 || err < best_err) {
+			best_period = period;
+			best_corr = corr;
+			best_err = err;
+		}
 	}
 
-	if (ratio < 1.0) {
-		corr = hw_inc - 1;
-		val = 1.0 / (hw_inc * (1.0 - ratio));
-	} else if (ratio > 1.0) {
-		corr = hw_inc + 1;
-		val = 1.0 / (hw_inc * (ratio - 1.0));
-	} else {
-		val = 0;
-		corr = hw_inc;
-	}
-
-	if (val >= INT32_MAX) {
-		/* Value is too high.
-		 * It is not possible to adjust the rate of the clock.
+	if (best_period == 0) {
+		/* delta is always small (truncation remainder plus a tiny PI
+		 * trim); this should not happen in practice.
 		 */
-		mul = 0;
-	} else {
-		mul = val;
+		return -EINVAL;
 	}
 
 	k_mutex_lock(&data->ptp_mutex, K_FOREVER);
 
-	ENET_Ptp1588AdjustTimer(data->base, corr, mul);
+	ENET_Ptp1588AdjustTimer(data->base, (uint32_t)best_corr, best_period);
 
 	k_mutex_unlock(&data->ptp_mutex);
 
 	return 0;
+}
+
+/* Seed the same exact correction at startup, before the PTP servo has ever
+ * called ptp_clock_nxp_enet_rate_adjust() (ratio == 1.0 case above), so the
+ * truncation bias is already cancelled during the pre-sync/pre-attach
+ * window.
+ */
+static void ptp_clock_nxp_enet_correct_baseline_rate(ENET_Type *base, uint32_t clk_hz)
+{
+	uint32_t hw_inc = NSEC_PER_SEC / clk_hz;
+	uint32_t remainder = NSEC_PER_SEC % clk_hz;
+	uint32_t g;
+	uint32_t delta;
+	uint32_t period;
+	uint32_t corr_max = ENET_ATINC_INC_CORR_MASK >> ENET_ATINC_INC_CORR_SHIFT;
+
+	if (remainder == 0) {
+		/* Exact divisor (e.g. 250 MHz -> 4 ns/tick); nothing to correct. */
+		return;
+	}
+
+	g = ptp_clock_nxp_enet_gcd(remainder, clk_hz);
+	delta = remainder / g;
+	period = clk_hz / g;
+
+	if (hw_inc + delta > corr_max) {
+		LOG_WRN("Cannot fully correct %u Hz PTP clock source truncation "
+			"(need INC_CORR=%u, max %u); PTP will not converge",
+			clk_hz, hw_inc + delta, corr_max);
+		return;
+	}
+
+	ENET_Ptp1588AdjustTimer(base, hw_inc + delta, period);
+
+	LOG_INF("PTP clock baseline: %u Hz source, INC=%u ns, "
+		"INC_CORR=%u ns every %u ticks (exact avg %u.%06u ns/tick)",
+		clk_hz, hw_inc, hw_inc + delta, period,
+		hw_inc, (uint32_t)(((uint64_t)remainder * 1000000U) / clk_hz));
 }
 
 void nxp_enet_ptp_clock_callback(const struct device *dev,
@@ -180,6 +269,7 @@ void nxp_enet_ptp_clock_callback(const struct device *dev,
 		ENET_Ptp1588SetChannelMode(data->base, kENET_PtpTimerChannel3,
 				kENET_PtpChannelPulseHighonCompare, true);
 		ENET_Ptp1588StartTimer(data->base, ptp_config.ptp1588ClockSrc_Hz);
+		ptp_clock_nxp_enet_correct_baseline_rate(data->base, ptp_config.ptp1588ClockSrc_Hz);
 		ENET_EnableInterrupts(data->base, ENET_TS_INTERRUPT);
 	}
 }
