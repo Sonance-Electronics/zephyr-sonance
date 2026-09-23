@@ -49,6 +49,18 @@ config ADJUST_LDO
 	default y
 	bool "Adjust LDO setting"
 
+config ENET_PTP_CLOCK_USE_XTAL
+	default n
+	bool "Use external 24 MHz crystal for ENET PTP clock"
+	depends on PTP_CLOCK_NXP_ENET
+	help
+	  Use the external 24 MHz crystal oscillator instead of the internal
+	  48 MHz RC oscillator divided by two for the ENET timestamp clock.
+	  Both sources provide a nominal 24 MHz clock, but a crystal generally
+	  offers better long-term frequency stability for PTP synchronization.
+	  Boards with a suitable external crystal can opt in; leave disabled
+	  to preserve the existing RC clock source on other boards.
+
 config INIT_VIDEO_PLL
 	default y
 

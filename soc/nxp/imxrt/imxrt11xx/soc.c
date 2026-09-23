@@ -439,7 +439,11 @@ __weak void clock_init(void)
 
 #if defined(CONFIG_PTP_CLOCK_NXP_ENET)
 	/* 24MHz PTP clock */
+#if defined(CONFIG_ENET_PTP_CLOCK_USE_XTAL)
+	rootCfg.mux = kCLOCK_ENET_TIMER1_ClockRoot_MuxOsc24MOut;
+#else
 	rootCfg.mux = kCLOCK_ENET_TIMER1_ClockRoot_MuxOscRc48MDiv2;
+#endif
 	rootCfg.div = 1;
 	CLOCK_SetRootClock(kCLOCK_Root_Enet_Timer1, &rootCfg);
 #endif
