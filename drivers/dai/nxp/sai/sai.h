@@ -134,14 +134,32 @@ LOG_MODULE_REGISTER(nxp_dai_sai);
 #define SAI_RX_SYNC_MODE(inst)\
 	DT_INST_PROP_OR(inst, rx_sync_mode, kSAI_ModeAsync)
 
+/* used to retrieve the DMA channel/mux cells for a given direction. The
+ * cell names to use depend on which DMA controller the `dmas` property
+ * points at:
+ *   - nxp,edma / nxp,sdma: cells are named "channel" and "mux"
+ *   - nxp,mcux-edma: cells are named "mux" (channel) and "source" (mux),
+ *     since that binding's first cell is the channel and its second cell
+ *     is the request/slot ID, despite the confusingly overlapping name.
+ */
+#define _SAI_DMA_CHANNEL_CELL(inst, dir)\
+	COND_CODE_1(DT_NODE_HAS_COMPAT(DT_INST_DMAS_CTLR_BY_NAME(inst, dir), nxp_mcux_edma),\
+		    (DT_INST_DMAS_CELL_BY_NAME(inst, dir, mux)),\
+		    (DT_INST_DMAS_CELL_BY_NAME(inst, dir, channel)))
+
+#define _SAI_DMA_MUX_CELL(inst, dir)\
+	COND_CODE_1(DT_NODE_HAS_COMPAT(DT_INST_DMAS_CTLR_BY_NAME(inst, dir), nxp_mcux_edma),\
+		    (DT_INST_DMAS_CELL_BY_NAME(inst, dir, source)),\
+		    (DT_INST_DMAS_CELL_BY_NAME(inst, dir, mux)))
+
 /* used to retrieve the handshake value for given direction. The handshake
  * is computed as follows:
  *	handshake = CHANNEL_ID | (MUX_VALUE << 8)
  * The channel ID and MUX value are each encoded in 8 bits.
  */
 #define SAI_TX_RX_DMA_HANDSHAKE(inst, dir)\
-	((DT_INST_DMAS_CELL_BY_NAME(inst, dir, channel) & GENMASK(7, 0)) |\
-	 ((DT_INST_DMAS_CELL_BY_NAME(inst, dir, mux) << 8) & GENMASK(15, 8)))
+	((_SAI_DMA_CHANNEL_CELL(inst, dir) & GENMASK(7, 0)) |\
+	 ((_SAI_DMA_MUX_CELL(inst, dir) << 8) & GENMASK(15, 8)))
 
 /* used to retrieve the number of supported transmission/receive lines */
 #define SAI_DLINE_COUNT(base)\
