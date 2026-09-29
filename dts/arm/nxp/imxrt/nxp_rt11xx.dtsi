@@ -1058,6 +1058,58 @@
 			reg = <0x40c84000 0x4000>;
 			#clock-cells = <4>;
 			#pll-clock-cells = <3>;
+
+			audio_pll: audio-pll {
+				compatible = "nxp,imxrt-audio-pll";
+				#clock-cells = <1>;
+				pll-src = <0>;
+				loop-divider = <32>;
+				post-divider = <1>;
+				/*
+				 * 24 MHz * (32 + 384000000/500000000) / 2 =
+				 * 393.216 MHz, which divides down to a
+				 * 12.288 MHz SAI bit clock.
+				 *
+				 * The fraction is scaled up because the
+				 * numerator is the only fine control over the
+				 * audio clock -- at a denominator of 1000 one
+				 * step is 30.5 ppm, far coarser than a PTP
+				 * servo needs, where this gives 0.06 ppb.
+				 *
+				 * The denominator is bounded by the numerator
+				 * field being *signed* 30-bit: a numerator at
+				 * or above 2^29 is read as negative and the
+				 * PLL silently runs slow, while the SDK's
+				 * read-back treats it as unsigned and still
+				 * reports the intended frequency. The trim
+				 * adds to the numerator, so the nominal plus
+				 * the full pull range has to stay below 2^29;
+				 * 500e6 leaves 25% headroom and keeps both
+				 * families' fractions exact.
+				 */
+				numerator = <384000000>;
+				denominator = <500000000>;
+				/*
+				 * 44.1 kHz family: 24 MHz * (30 +
+				 * 52800000/500000000) / 2 = 361.2672 MHz, which
+				 * divides by the same root and bit clock
+				 * dividers as the 48 kHz family above to give
+				 * 11.2896 MHz at 44.1 kHz. Also exact, and the
+				 * loop divider stays inside the PLL's valid
+				 * 27..54 range.
+				 */
+				loop-divider-44k1 = <30>;
+				numerator-44k1 = <52800000>;
+				/*
+				 * Disabled by default: once enabled the driver
+				 * reprograms the PLL at boot, which a board that
+				 * does no audio does not want, and i2s_mcux_sai.c
+				 * programs the PLL itself without taking this
+				 * driver's lock. A board enables it when a
+				 * consumer references it.
+				 */
+				status = "disabled";
+			};
 		};
 
 		edma0: dma-controller@40070000 {

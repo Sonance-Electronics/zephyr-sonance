@@ -15,6 +15,13 @@ config CLOCK_CONTROL_MCUX_CCM_REV2
 	help
 	  Enable support for mcux ccm rev 2 driver.
 
+config CLOCK_CONTROL_MCUX_AUDIO_PLL
+	bool "NXP i.MX RT audio PLL driver"
+	default y
+	depends on DT_HAS_NXP_IMXRT_AUDIO_PLL_ENABLED
+	help
+	  Enable support for the i.MX RT audio PLL shared by SAI peripherals.
+
 config CLOCK_CONTROL_MCUX_MCG
 	bool "MCUX MCG driver"
 	default y
