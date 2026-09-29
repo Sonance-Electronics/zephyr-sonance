@@ -11,7 +11,14 @@
 #include <zephyr/logging/log.h>
 #include <fsl_sai.h>
 
-LOG_MODULE_REGISTER(nxp_dai_sai);
+/*
+ * No LOG_MODULE_REGISTER() here. The static inline helpers below log, so the
+ * including translation unit has to set the module up first: sai.c registers
+ * it before including this header, and any other user must call
+ * LOG_MODULE_DECLARE() for the same module. Registering in the header would
+ * limit it to exactly one includer, since a second one would define the
+ * module's log_const data all over again.
+ */
 
 #ifdef CONFIG_SAI_HAS_MCLK_CONFIG_OPTION
 #define SAI_MCLK_MCR_MSEL_SHIFT 24
