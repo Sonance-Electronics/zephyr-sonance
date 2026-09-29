@@ -9,6 +9,9 @@
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/dt-bindings/clock/imx_ccm_rev2.h>
 #include <fsl_clock.h>
+#if defined(CONFIG_CLOCK_CONTROL_MCUX_AUDIO_PLL)
+#include <zephyr/drivers/clock_control/nxp_imxrt_audio_pll.h>
+#endif
 #if defined(CONFIG_SOC_MIMX9352)
 #include <soc.h>
 #endif
@@ -75,6 +78,8 @@ static int mcux_ccm_get_subsys_rate(const struct device *dev,
 {
 	uint32_t clock_name = (size_t) sub_system;
 	uint32_t clock_root, peripheral, instance;
+	/* Only read when the audio PLL driver is built in. */
+	__maybe_unused bool sai_root = false;
 
 	peripheral = (clock_name & IMX_CCM_PERIPHERAL_MASK);
 	instance = (clock_name & IMX_CCM_INSTANCE_MASK);
@@ -175,23 +180,33 @@ static int mcux_ccm_get_subsys_rate(const struct device *dev,
 		break;
 #endif
 
-#ifdef CONFIG_I2S_MCUX_SAI
 #if (defined(CONFIG_SOC_MIMX9352) || defined(CONFIG_SOC_MIMX9131) || defined(CONFIG_SOC_MIMX9111))
+#ifdef CONFIG_I2S_MCUX_SAI
 	case IMX_CCM_SAI1_CLK:
 		clock_root = kCLOCK_Root_Sai1 + instance;
 		break;
+#endif
 #else
+/*
+ * The SAI clock roots exist regardless of which SAI driver consumes them, so
+ * the rate query is available to the DAI driver as well as the I2S one.
+ */
+#if defined(CONFIG_I2S_MCUX_SAI) || defined(CONFIG_DAI_NXP_SAI)
 	case IMX_CCM_SAI1_CLK:
 		clock_root = kCLOCK_Root_Sai1;
+		sai_root = true;
 		break;
 	case IMX_CCM_SAI2_CLK:
 		clock_root = kCLOCK_Root_Sai2;
+		sai_root = true;
 		break;
 	case IMX_CCM_SAI3_CLK:
 		clock_root = kCLOCK_Root_Sai3;
+		sai_root = true;
 		break;
 	case IMX_CCM_SAI4_CLK:
 		clock_root = kCLOCK_Root_Sai4;
+		sai_root = true;
 		break;
 #endif
 #endif
@@ -374,6 +389,22 @@ static int mcux_ccm_get_subsys_rate(const struct device *dev,
 	|| defined(CONFIG_SOC_MIMX9111)
 	*rate = CLOCK_GetIpFreq(clock_root);
 #else
+#if defined(CONFIG_CLOCK_CONTROL_MCUX_AUDIO_PLL)
+	/*
+	 * A SAI root is normally fed by the audio PLL, and computing its rate
+	 * reads the PLL through the shared analog interface. That access must
+	 * not interleave with the audio PLL driver's own: see
+	 * nxp_imxrt_audio_pll_lock().
+	 */
+	if (sai_root) {
+		const struct device *audio_pll = DEVICE_DT_GET_ONE(nxp_imxrt_audio_pll);
+
+		nxp_imxrt_audio_pll_lock(audio_pll);
+		*rate = CLOCK_GetRootClockFreq(clock_root);
+		nxp_imxrt_audio_pll_unlock(audio_pll);
+		return 0;
+	}
+#endif
 	*rate = CLOCK_GetRootClockFreq(clock_root);
 #endif
 	return 0;
