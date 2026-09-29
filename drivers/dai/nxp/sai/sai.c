@@ -614,7 +614,21 @@ static int sai_trigger_pause(const struct device *dev,
 
 	ret = sai_tx_rx_disable(data, cfg, dir);
 	if (ret < 0) {
-		return ret;
+		/*
+		 * As in sai_trigger_stop(): the disable has already been
+		 * requested and only the wait for the hardware to follow
+		 * timed out, so finish the teardown rather than returning
+		 * with the direction still marked enabled and its data line
+		 * still unmasked while the state claims PAUSED. A resume
+		 * would otherwise re-enable a direction that was never taken
+		 * down.
+		 *
+		 * PAUSED is kept, unlike the stop path. It still permits both
+		 * RUNNING and STOPPING, so there is no dead end to recover
+		 * from, and forcing another state would discard the pause the
+		 * caller asked for.
+		 */
+		LOG_ERR("timed out disabling dir %d while pausing", dir);
 	}
 
 	/* disable TX/RX data line */
@@ -623,7 +637,7 @@ static int sai_trigger_pause(const struct device *dev,
 	/* update the software state of TX/RX */
 	sai_tx_rx_sw_enable_disable(dir, data, false);
 
-	return 0;
+	return ret;
 }
 
 static int sai_trigger_stop(const struct device *dev,
