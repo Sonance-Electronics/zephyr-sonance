@@ -631,7 +631,7 @@ static int sai_trigger_stop(const struct device *dev,
 {
 	struct sai_data *data;
 	const struct sai_config *cfg;
-	int ret;
+	int ret, pm_ret;
 	uint32_t old_state;
 
 	data = dev->data;
@@ -663,7 +663,25 @@ static int sai_trigger_stop(const struct device *dev,
 
 	ret = sai_tx_rx_disable(data, cfg, dir);
 	if (ret < 0) {
-		return ret;
+		/*
+		 * The disable has already been requested -- sai_dir_disable()
+		 * writes the register and only the wait for the hardware to
+		 * follow timed out -- so finish the teardown rather than
+		 * bailing out half done.
+		 *
+		 * Returning here left the direction in STOPPING with its FIFO
+		 * error interrupt still enabled. There is no transition out of
+		 * STOPPING except a completed stop, so every later stop was
+		 * refused with -EPERM and the direction could never be
+		 * recovered; meanwhile a receiver still clocking raised a FIFO
+		 * error every frame, indefinitely. One timeout thus turned a
+		 * running stream into a dead one that could not be restarted.
+		 *
+		 * Force the direction to READY so a caller can retry, and
+		 * still report the failure.
+		 */
+		LOG_ERR("timed out disabling dir %d, forcing it to READY", dir);
+		sai_update_state(dir, data, DAI_STATE_READY);
 	}
 
 	/* update the software state of TX/RX */
@@ -682,7 +700,13 @@ out_dmareq_disable:
 
 	irq_disable(cfg->irq);
 
-	return pm_device_runtime_put(dev);
+	/*
+	 * The teardown above has to happen on the failure path too, so a
+	 * disable timeout is only reported once it is complete.
+	 */
+	pm_ret = pm_device_runtime_put(dev);
+
+	return ret < 0 ? ret : pm_ret;
 }
 
 /* notes:
