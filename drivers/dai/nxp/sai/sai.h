@@ -36,38 +36,35 @@ LOG_MODULE_REGISTER(nxp_dai_sai);
 #define _SAI_CLOCK_INDEX_ARRAY(inst)\
 	LISTIFY(DT_INST_PROP_LEN_OR(inst, clocks, 0), IDENTITY_VARGS, (,))
 
-/* used to retrieve a clock's ID using its index generated via _SAI_CLOCK_INDEX_ARRAY */
-#define _SAI_GET_CLOCK_ID(clock_idx, inst)\
-	DT_INST_PHA_BY_IDX_OR(inst, clocks, clock_idx, name, 0x0)
+/* used to retrieve a clock entry (controller + ID) using its index generated
+ * via _SAI_CLOCK_INDEX_ARRAY. Each entry captures its own controller device
+ * rather than assuming every entry in `clocks` shares one producer, since
+ * that's not true once a SAI node lists clocks from more than one provider
+ * (e.g. a peripheral gate from the CCM plus a shared PLL enable).
+ */
+#define _SAI_GET_CLOCK_ENTRY(clock_idx, inst)\
+	{ .dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR_BY_IDX(inst, clock_idx)),\
+	  .id = DT_INST_PHA_BY_IDX_OR(inst, clocks, clock_idx, name, 0x0) }
 
 /* used to retrieve a clock's name using its index generated via _SAI_CLOCK_INDEX_ARRAY */
 #define _SAI_GET_CLOCK_NAME(clock_idx, inst)\
 	DT_INST_PROP_BY_IDX(inst, clock_names, clock_idx)
 
-/* used to convert the clocks property into an array of clock IDs */
-#define _SAI_CLOCK_ID_ARRAY(inst)\
-	FOR_EACH_FIXED_ARG(_SAI_GET_CLOCK_ID, (,), inst, _SAI_CLOCK_INDEX_ARRAY(inst))
+/* used to convert the clocks property into an array of clock entries */
+#define _SAI_CLOCK_ENTRY_ARRAY(inst)\
+	FOR_EACH_FIXED_ARG(_SAI_GET_CLOCK_ENTRY, (,), inst, _SAI_CLOCK_INDEX_ARRAY(inst))
 
 /* used to convert the clock-names property into an array of clock names */
 #define _SAI_CLOCK_NAME_ARRAY(inst)\
 	FOR_EACH_FIXED_ARG(_SAI_GET_CLOCK_NAME, (,), inst, _SAI_CLOCK_INDEX_ARRAY(inst))
 
-/* used to convert a clocks property into an array of clock IDs. If the property
- * is not specified then this macro will return {}.
+/* used to convert a clocks property into an array of clock entries. If the
+ * property is not specified then this macro will return {}.
  */
 #define _SAI_GET_CLOCK_ARRAY(inst)\
 	COND_CODE_1(DT_NODE_HAS_PROP(DT_INST(inst, nxp_dai_sai), clocks),\
-		    ({ _SAI_CLOCK_ID_ARRAY(inst) }),\
+		    ({ _SAI_CLOCK_ENTRY_ARRAY(inst) }),\
 		    ({ }))
-
-/* used to retrieve a const struct device *dev pointing to the clock controller.
- * It is assumed that all SAI clocks come from a single clock provider.
- * This macro returns a NULL if the clocks property doesn't exist.
- */
-#define _SAI_GET_CLOCK_CONTROLLER(inst)\
-	COND_CODE_1(DT_NODE_HAS_PROP(DT_INST(inst, nxp_dai_sai), clocks),\
-		    (DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(inst))),\
-		    (NULL))
 
 /* used to convert a clock-names property into an array of clock names. If the
  * property is not specified then this macro will return {}.
@@ -80,9 +77,8 @@ LOG_MODULE_REGISTER(nxp_dai_sai);
 /* used to declare a struct clock_data */
 #define SAI_CLOCK_DATA_DECLARE(inst)					\
 {									\
-	.clocks = (uint32_t [])_SAI_GET_CLOCK_ARRAY(inst),		\
+	.clocks = (struct sai_clock_entry [])_SAI_GET_CLOCK_ARRAY(inst),\
 	.clock_num = DT_INST_PROP_LEN_OR(inst, clocks, 0),		\
-	.dev = _SAI_GET_CLOCK_CONTROLLER(inst),				\
 	.clock_names = (const char *[])_SAI_GET_CLOCK_NAMES(inst),	\
 }
 
@@ -237,11 +233,14 @@ LOG_MODULE_REGISTER(nxp_dai_sai);
 #define SAI_TX_RX_DLINE_MASK(dir, cfg)\
 	((dir) == DAI_DIR_TX ? BIT((cfg)->tx_dline) : BIT((cfg)->rx_dline))
 
-struct sai_clock_data {
-	uint32_t *clocks;
-	uint32_t clock_num;
-	/* assumption: all clocks belong to the same producer */
+struct sai_clock_entry {
 	const struct device *dev;
+	uint32_t id;
+};
+
+struct sai_clock_data {
+	struct sai_clock_entry *clocks;
+	uint32_t clock_num;
 	const char **clock_names;
 };
 
@@ -369,8 +368,8 @@ static int get_mclk_rate(const struct sai_clock_data *clk_data,
 		return clk_idx;
 	}
 
-	return clock_control_get_rate(clk_data->dev,
-				      UINT_TO_POINTER(clk_data->clocks[clk_idx]),
+	return clock_control_get_rate(clk_data->clocks[clk_idx].dev,
+				      UINT_TO_POINTER(clk_data->clocks[clk_idx].id),
 				      rate);
 }
 #endif /* CONFIG_SAI_HAS_MCLK_CONFIG_OPTION */

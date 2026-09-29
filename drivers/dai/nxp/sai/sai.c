@@ -831,22 +831,24 @@ static int sai_clks_enable_disable(const struct device *dev, bool enable)
 {
 	int i, ret;
 	const struct sai_config *cfg;
+	const struct device *clk_dev;
 	void *clk_id;
 
 	cfg = dev->config;
 
 	for (i = 0; i < cfg->clk_data.clock_num; i++) {
-		clk_id = UINT_TO_POINTER(cfg->clk_data.clocks[i]);
+		clk_dev = cfg->clk_data.clocks[i].dev;
+		clk_id = UINT_TO_POINTER(cfg->clk_data.clocks[i].id);
 
 		if (enable) {
-			ret = clock_control_on(cfg->clk_data.dev, clk_id);
+			ret = clock_control_on(clk_dev, clk_id);
 		} else {
-			ret = clock_control_off(cfg->clk_data.dev, clk_id);
+			ret = clock_control_off(clk_dev, clk_id);
 		}
 
 		if (ret < 0) {
 			LOG_ERR("failed to gate/ungate clock %u: %d",
-				cfg->clk_data.clocks[i], ret);
+				cfg->clk_data.clocks[i].id, ret);
 			return ret;
 		}
 	}
