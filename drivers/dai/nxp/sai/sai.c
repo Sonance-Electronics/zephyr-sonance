@@ -224,6 +224,18 @@ static int sai_config_set(const struct device *dev,
 		return -EINVAL;
 	}
 
+	/*
+	 * struct sai_bespoke_config has to match SOF's
+	 * sof_ipc_dai_sai_params exactly, so a caller built against a
+	 * different version of it would be silently misread field by field.
+	 * Reject anything too short rather than reading past the end of it.
+	 */
+	if (size < sizeof(struct sai_bespoke_config)) {
+		LOG_ERR("bespoke config too small: %zu, need %zu",
+			size, sizeof(struct sai_bespoke_config));
+		return -EINVAL;
+	}
+
 	bespoke = bespoke_data;
 	data = dev->data;
 	sai_cfg = dev->config;
