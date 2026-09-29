@@ -91,6 +91,26 @@ static int sai_mclk_config(const struct device *dev,
 }
 #endif /* CONFIG_SAI_HAS_MCLK_CONFIG_OPTION */
 
+/*
+ * Minimum gap between FIFO error reports, per direction.
+ *
+ * The error flag can be raised on every frame, so one stall becomes a
+ * flood: an RX ring left undrained for 9 ms produced 237 of these, which
+ * is 1.25 s of output on a 115200 console -- the log becomes a far bigger
+ * problem than the event it describes, and on a shared console it looks
+ * like the system has hung. 100 ms collapses a burst into a single line
+ * while still separating events a tenth of a second apart.
+ *
+ * The limit is kept per call site, so TX and RX are limited independently
+ * but every SAI instance shares each one. The count of what was held back
+ * prints as "Skipped N messages" just before the next report, so a burst
+ * that ends mid-interval goes unreported until the next error.
+ *
+ * With CONFIG_LOG_RATELIMIT=n these warnings follow
+ * CONFIG_LOG_RATELIMIT_FALLBACK, whose default drops them entirely.
+ */
+#define SAI_FIFO_ERROR_REPORT_MS 100U
+
 void sai_isr(const void *parameter)
 {
 	const struct device *dev;
@@ -101,13 +121,13 @@ void sai_isr(const void *parameter)
 
 	/* check for TX FIFO error */
 	if (SAI_TX_RX_STATUS_IS_SET(DAI_DIR_TX, data->regmap, kSAI_FIFOErrorFlag)) {
-		LOG_WRN("FIFO underrun detected");
+		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO underrun detected");
 		SAI_TX_RX_STATUS_CLEAR(DAI_DIR_TX, data->regmap, kSAI_FIFOErrorFlag);
 	}
 
 	/* check for RX FIFO error */
 	if (SAI_TX_RX_STATUS_IS_SET(DAI_DIR_RX, data->regmap, kSAI_FIFOErrorFlag)) {
-		LOG_WRN("FIFO overrun detected");
+		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO overrun detected");
 		SAI_TX_RX_STATUS_CLEAR(DAI_DIR_RX, data->regmap, kSAI_FIFOErrorFlag);
 	}
 }
