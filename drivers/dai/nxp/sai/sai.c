@@ -19,7 +19,21 @@ LOG_MODULE_REGISTER(nxp_dai_sai, CONFIG_DAI_LOG_LEVEL);
 /* used for binding the driver */
 #define DT_DRV_COMPAT nxp_dai_sai
 
-#define SAI_TX_RX_HW_DISABLE_TIMEOUT 50
+/*
+ * How long to wait for the transmitter/receiver to actually go down.
+ *
+ * The hardware only clears its enable bit at the end of the frame it is
+ * in, so the wait has to cover a whole frame period. This was a flat
+ * 50 us, which is already less than three frames at 44.1 kHz (22.7 us
+ * each) and a fraction of one at the lower rates the hardware supports --
+ * 125 us at 8 kHz -- so a stop could time out simply because the frame
+ * had not finished.
+ *
+ * Allow four frames at the configured rate, with a floor for the fast
+ * rates and for the case where no rate has been configured yet.
+ */
+#define SAI_TX_RX_HW_DISABLE_TIMEOUT_US(rate)\
+	((rate) != 0U ? CLAMP((4U * 1000000U) / (rate), 100U, 20000U) : 20000U)
 
 /* TODO list:
  *
@@ -513,7 +527,8 @@ static bool sai_dir_disable(struct sai_data *data, enum dai_dir dir)
 	 * or not.
 	 */
 	return WAIT_FOR(!SAI_TX_RX_IS_HW_ENABLED(dir, data->regmap),
-			SAI_TX_RX_HW_DISABLE_TIMEOUT, k_busy_wait(1));
+			SAI_TX_RX_HW_DISABLE_TIMEOUT_US(data->cfg.rate),
+			k_busy_wait(1));
 }
 
 static int sai_tx_rx_disable(struct sai_data *data,
