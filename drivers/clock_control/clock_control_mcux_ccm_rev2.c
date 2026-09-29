@@ -212,10 +212,27 @@ static int mcux_ccm_get_subsys_rate(const struct device *dev,
 #endif
 
 #ifdef CONFIG_ETH_NXP_ENET
+	/*
+	 * All four ENET ids mask to this one peripheral, so IMX_CCM_ENET1G_CLK
+	 * and the two _PLL ids can only be told apart by the instance field.
+	 */
 	case IMX_CCM_ENET_CLK:
-	case IMX_CCM_ENET1G_CLK:
 #if defined(CONFIG_SOC_MIMX9352) || defined(CONFIG_SOC_MIMX9131)
 		clock_root = kCLOCK_Root_WakeupAxi;
+#elif defined(CONFIG_SOC_SERIES_IMXRT11XX)
+		switch (instance) {
+		case IMX_CCM_ENET_PLL & IMX_CCM_INSTANCE_MASK:
+			/* 1588 timestamp reference, not the module clock. */
+			clock_root = kCLOCK_Root_Enet_Timer1;
+			break;
+		case IMX_CCM_ENET1G_PLL & IMX_CCM_INSTANCE_MASK:
+			clock_root = kCLOCK_Root_Enet_Timer2;
+			break;
+		default:
+			/* MAC module clock: ENET_Init() derives MDC from it. */
+			clock_root = kCLOCK_Root_Bus;
+			break;
+		}
 #else
 		clock_root = kCLOCK_Root_Bus;
 #endif
