@@ -1,0 +1,64 @@
+# Copyright 2026 Sonance
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  NXP i.MX RT audio PLL, shared by all SAI peripherals on the SoC.
+
+  Exposed as a clock_control device rather than a plain-data node so a SAI
+  node can list it as one of its `clocks` entries, alongside its usual
+  peripheral-gate clock: `clock_control_on()` is what actually configures
+  it. The audio PLL itself is configured once, during this device's own
+  init (regardless of how many SAI instances reference it); each `on()`
+  call afterwards just selects the calling SAI instance's own root clock
+  mux/divider, decoded from the single packed cell value (see
+  include/zephyr/dt-bindings/clock/nxp_imxrt_audio_pll.h).
+
+compatible: "nxp,imxrt-audio-pll"
+
+include: [clock-controller.yaml, base.yaml]
+
+properties:
+  "#clock-cells":
+    const: 1
+
+  pll-src:
+    type: int
+    required: true
+    description: audio PLL clock source selector
+
+  loop-divider:
+    type: int
+    required: true
+    description: audio PLL loop divider
+
+  post-divider:
+    type: int
+    required: true
+    description: audio PLL post divider
+
+  numerator:
+    type: int
+    required: true
+    description: audio PLL fractional loop divider numerator
+
+  denominator:
+    type: int
+    required: true
+    description: audio PLL fractional loop divider denominator
+
+  loop-divider-44k1:
+    type: int
+    description: |
+      Loop divider for the 44.1 kHz rate family, selected at runtime by
+      nxp_imxrt_audio_pll_set_family(). The properties above describe the
+      48 kHz family, which is also what the PLL is configured for at init.
+      Omit both 44k1 properties on boards that only ever run one family.
+
+  numerator-44k1:
+    type: int
+    description: |
+      Fractional numerator for the 44.1 kHz rate family, over the same
+      denominator as the 48 kHz family.
+
+clock-cells:
+  - name
