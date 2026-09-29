@@ -9,6 +9,10 @@
 #include <zephyr/kernel.h>
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/pm/device.h>
+#include <zephyr/logging/log.h>
+
+/* must precede sai.h, whose inline helpers log */
+LOG_MODULE_REGISTER(nxp_dai_sai, CONFIG_DAI_LOG_LEVEL);
 
 #include "sai.h"
 
