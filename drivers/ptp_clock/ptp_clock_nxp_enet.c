@@ -107,6 +107,33 @@ static uint32_t ptp_clock_nxp_enet_gcd(uint32_t a, uint32_t b)
 }
 
 /*
+ * Add corr ns instead of ATINC.INC once every period ticks.
+ *
+ * The hardware applies the correction every ATCOR.COR + 1 ticks, so the
+ * register takes period - 1; ENET_Ptp1588AdjustTimer() writes its argument
+ * verbatim. The reference manual says the correction counter increments
+ * once per timer clock cycle and, on reaching COR, restarts and applies the
+ * correction in that same cycle, but not what value it restarts at. From 0
+ * it counts 0 to COR inclusive, COR + 1 ticks; only a restart at 1 would
+ * give COR.
+ *
+ * Measured on an RT1176 at 24 MHz with INC = 41 and INC_CORR = 43, where a
+ * period of 3 is exact: COR = 3 ran the timer 4016 ppm slow, i.e. a period
+ * of 4, (3 * 41 + 43) / 4 = 41.5 ns/tick. A crystal-derived SAI bit clock
+ * measured over a PTP second read 4011-4014 ppm fast. Rewriting COR to 2
+ * live brought it to within 1 ppm, where a period of 2 would have run
+ * 8000 ppm fast.
+ *
+ * A period of 1 is not representable, since COR = 0 disables correction.
+ */
+static void ptp_clock_nxp_enet_set_correction(ENET_Type *base, uint32_t corr,
+					      uint32_t period)
+{
+	__ASSERT_NO_MSG(period >= 2U);
+	ENET_Ptp1588AdjustTimer(base, corr, period - 1U);
+}
+
+/*
  * ENET_Ptp1588StartTimer() sets ATINC.INC to floor(NSEC_PER_SEC / clk_hz),
  * truncating any fractional ns/tick (e.g. 24 MHz -> 41.667 ns/tick truncates
  * to 41, a static ~1.6% slow bias). The original upstream implementation of
@@ -115,7 +142,8 @@ static uint32_t ptp_clock_nxp_enet_gcd(uint32_t a, uint32_t b)
  * smaller than the 1.6% truncation bias, so it either silently rejected
  * every correction (-EINVAL, discarded by the PTP servo caller) or, once the
  * offset was small enough to request a ratio inside that range, applied a
- * *worse* approximation (INC_CORR=42/ATCOR=2, average 41.5 ns/tick) that
+ * *worse* approximation (INC_CORR=42/ATCOR=2, average 41.33 ns/tick given
+ * the COR + 1 period above) that
  * clobbered any better-informed correction already in the registers. Either
  * way the true ~1.6% bias was never actually cancelled: confirmed on
  * hardware -- the local/grandmaster 1PPS edges drifted at the same rate
@@ -161,7 +189,8 @@ static int ptp_clock_nxp_enet_rate_adjust(const struct device *dev,
 	 */
 	delta = target * ratio - (double)hw_inc;
 
-	for (period = 1; period <= corr_max; period++) {
+	/* From 2: see ptp_clock_nxp_enet_set_correction(). */
+	for (period = 2; period <= corr_max; period++) {
 		int32_t corr = (int32_t)hw_inc +
 			(int32_t)floor(delta * period + 0.5);
 		double err;
@@ -188,7 +217,7 @@ static int ptp_clock_nxp_enet_rate_adjust(const struct device *dev,
 
 	k_mutex_lock(&data->ptp_mutex, K_FOREVER);
 
-	ENET_Ptp1588AdjustTimer(data->base, (uint32_t)best_corr, best_period);
+	ptp_clock_nxp_enet_set_correction(data->base, (uint32_t)best_corr, best_period);
 
 	k_mutex_unlock(&data->ptp_mutex);
 
@@ -225,7 +254,8 @@ static void ptp_clock_nxp_enet_correct_baseline_rate(ENET_Type *base, uint32_t c
 		return;
 	}
 
-	ENET_Ptp1588AdjustTimer(base, hw_inc + delta, period);
+	/* period >= 2: g divides remainder, which is less than clk_hz. */
+	ptp_clock_nxp_enet_set_correction(base, hw_inc + delta, period);
 
 	LOG_INF("PTP clock baseline: %u Hz source, INC=%u ns, "
 		"INC_CORR=%u ns every %u ticks (exact avg %u.%06u ns/tick)",
