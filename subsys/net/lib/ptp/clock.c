@@ -356,9 +356,16 @@ const struct ptp_clock *ptp_clock_init(void)
 	precision_pi_init(&ptp_clk.pi, (double)CONFIG_PRECISION_TIMING_PI_KP / 1000.0,
 			  (double)CONFIG_PRECISION_TIMING_PI_KI / 1000.0);
 
+	/*
+	 * The thread blocks in zsock_poll() with no timeout and is woken for
+	 * timer events only through this eventfd. Without it, timeouts are
+	 * recorded but never acted on, so a port with no PTP traffic to wake
+	 * it never leaves LISTENING.
+	 */
 	ret = zvfs_eventfd(0, ZVFS_EFD_NONBLOCK);
 	if (ret < 0) {
-		LOG_ERR("Failed to create event fd (err %d)", -errno);
+		LOG_ERR("Failed to create event fd (err %d); raise CONFIG_ZVFS_EVENTFD_MAX",
+			-errno);
 		return NULL;
 	}
 	ptp_clk.pollfd[0].fd = ret;
