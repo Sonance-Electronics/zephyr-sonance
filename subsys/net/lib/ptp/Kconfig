@@ -35,13 +35,25 @@ config PTP_INIT_PRIO
 	int "Startup priority for the PTP stack init"
 	default 96
 
+config PTP_SERVICE_THREAD_PRIO_CUSTOM
+	bool "Customize the PTP service thread priority"
+	help
+	  The PTP thread runs at K_PRIO_COOP(1) by default, so nothing else
+	  can run while it sends a message through the network stack. Enable
+	  this to run it at PTP_SERVICE_THREAD_PRIO instead. Message
+	  timestamps are taken in hardware, so scheduling delay does not
+	  affect the accuracy of the time they carry.
+
 config PTP_SERVICE_THREAD_PRIO
 	int "Priority of the PTP service thread"
-	default NUM_PREEMPT_PRIORITIES
+	default 0
+	depends on PTP_SERVICE_THREAD_PRIO_CUSTOM
 	help
 	  Set the priority of the PTP. This handler polls the sockets and checks
 	  timers, depending on received PTP messages or timeouts actions defined
 	  in the standard are taken. The value should be selected carefully.
+	  It must be a valid thread priority: NUM_PREEMPT_PRIORITIES is
+	  reserved for the idle thread.
 
 config PTP_MSG_POLL_SIZE
 	int "Number of messages available for allocation"
