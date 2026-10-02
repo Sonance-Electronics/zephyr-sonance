@@ -41,10 +41,7 @@ LOG_MODULE_REGISTER(nxp_dai_sai, CONFIG_DAI_LOG_LEVEL);
  * In the case of STOP(), the operation should be split into TRIGGER_STOP
  * and TRIGGER_POST_STOP. (SOF)
  *
- * 2) The SAI ISR should stop the SAI whenever a FIFO error interrupt
- * is raised.
- *
- * 3) Transmitter/receiver may remain enabled after sai_tx_rx_disable().
+ * 2) Transmitter/receiver may remain enabled after sai_tx_rx_disable().
  * Fix this.
  */
 
@@ -125,24 +122,117 @@ static int sai_mclk_config(const struct device *dev,
  */
 #define SAI_FIFO_ERROR_REPORT_MS 100U
 
+/*
+ * Handle a FIFO error on one direction. Returns true if the direction was
+ * halted.
+ *
+ * A FIFO error loses words from the middle of a frame. FCONT is left at 0,
+ * so once the error flag is cleared the SAI resumes at the start of the next
+ * frame, but the partial frame already handed to DMA stays in the stream and
+ * every word after it lands in the wrong slot: the channels are permanently
+ * swapped. Only the consumer, which owns the DMA buffers, can resynchronise,
+ * by stopping and restarting.
+ *
+ * With CONFIG_DAI_NXP_SAI_STOP_ON_FIFO_ERROR, halt the direction so nothing
+ * misaligned follows: stop its DMA requests, leave the error flag set, which
+ * with FCONT at 0 holds the FIFO from the next frame on, and mask the
+ * interrupt so the held flag does not re-raise it. Disabling the
+ * transmitter/receiver itself would mean waiting for the frame to end, which
+ * cannot be done here, and in synchronous mode can take the other direction
+ * down with it. The direction then sits in DAI_STATE_ERROR until the
+ * consumer re-arms its DMA and calls dai_nxp_sai_recover(), which keeps it
+ * enabled throughout, or until DAI_TRIGGER_STOP, after which
+ * DAI_TRIGGER_START's software reset makes the first word slot 0 again.
+ *
+ * Only a RUNNING direction is halted. One already stopping, or paused, is
+ * on its way down anyway and just has its flag cleared, as before.
+ *
+ * A direction already halted is left as it is: clearing its held flag
+ * would let it run on with its DMA requests off. Its error interrupt and
+ * DMA requests are cleared again, in case a register write that raced the
+ * halt set them back, and nothing is counted or reported. Returns false in
+ * that case, and otherwise sets *@halted to whether the direction was
+ * halted.
+ */
+static bool sai_fifo_error(const struct device *dev, enum dai_dir dir, bool *halted)
+{
+	struct sai_data *data = dev->data;
+
+	if (sai_get_state(dir, data) == DAI_STATE_ERROR) {
+		sai_tx_rx_halt(data, dir);
+		return false;
+	}
+
+	*halted = false;
+
+	if (dir == DAI_DIR_RX) {
+		data->rx_fifo_errors++;
+	} else {
+		data->tx_fifo_errors++;
+	}
+
+	if (IS_ENABLED(CONFIG_DAI_NXP_SAI_STOP_ON_FIFO_ERROR) &&
+	    sai_update_state(dir, data, DAI_STATE_ERROR) == 0) {
+		sai_tx_rx_halt(data, dir);
+		*halted = true;
+	} else {
+		SAI_TX_RX_STATUS_CLEAR(dir, data->regmap, kSAI_FIFOErrorFlag);
+	}
+
+	if (data->error_cb != NULL) {
+		data->error_cb(dev, dir, *halted, data->error_cb_data);
+	}
+
+	return true;
+}
+
+/*
+ * TX and RX share one interrupt, and this checks both directions whichever
+ * raised it, so a set FIFO error flag alone is not enough: a direction is
+ * only handled if its error interrupt is enabled.
+ *
+ * A direction halted by sai_fifo_error() holds its flag set on purpose,
+ * with the interrupt masked. Handling it again when the other direction
+ * raised the interrupt would clear the held flag, letting the halted
+ * direction run on from the next frame with its DMA requests off, count
+ * the error twice, and report the direction to the error callback as not
+ * halted.
+ *
+ * Thread code updates TCSR/RCSR with unlocked read-modify-writes, so one
+ * that the halt interrupted can set the error interrupt enable back. The
+ * HAL masks the write-1-to-clear flags in those writes, so the held flag
+ * survives, and the interrupt fires again at once; sai_fifo_error() then
+ * finds the direction halted and masks it again.
+ *
+ * A stopped direction has the interrupt masked too. Its last frame may
+ * overrun or underrun as it goes down; that data is discarded anyway, and
+ * START clears the flag, so it is not reported as an error.
+ *
+ * In synchronous mode, enabling the SYNC direction also enables the ASYNC
+ * one in hardware, without a START, so with its interrupt masked. Its FIFO
+ * errors, which nobody consumes, are not reported either.
+ */
 void sai_isr(const void *parameter)
 {
 	const struct device *dev;
 	struct sai_data *data;
+	bool halted;
 
 	dev = parameter;
 	data = dev->data;
 
 	/* check for TX FIFO error */
-	if (SAI_TX_RX_STATUS_IS_SET(DAI_DIR_TX, data->regmap, kSAI_FIFOErrorFlag)) {
-		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO underrun detected");
-		SAI_TX_RX_STATUS_CLEAR(DAI_DIR_TX, data->regmap, kSAI_FIFOErrorFlag);
+	if (sai_tx_rx_fifo_error_pending(data, DAI_DIR_TX) &&
+	    sai_fifo_error(dev, DAI_DIR_TX, &halted)) {
+		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO underrun detected%s",
+				       halted ? ", TX halted until restarted" : "");
 	}
 
 	/* check for RX FIFO error */
-	if (SAI_TX_RX_STATUS_IS_SET(DAI_DIR_RX, data->regmap, kSAI_FIFOErrorFlag)) {
-		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO overrun detected");
-		SAI_TX_RX_STATUS_CLEAR(DAI_DIR_RX, data->regmap, kSAI_FIFOErrorFlag);
+	if (sai_tx_rx_fifo_error_pending(data, DAI_DIR_RX) &&
+	    sai_fifo_error(dev, DAI_DIR_RX, &halted)) {
+		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO overrun detected%s",
+				       halted ? ", RX halted until restarted" : "");
 	}
 }
 
@@ -831,6 +921,12 @@ static int sai_trigger_start(const struct device *dev,
 
 	irq_enable(cfg->irq);
 
+	/* a FIFO error that halted this direction leaves its flag set (see
+	 * sai_fifo_error()); clear it so it neither holds the FIFO nor raises
+	 * an interrupt the moment the error interrupt is enabled
+	 */
+	SAI_TX_RX_STATUS_CLEAR(dir, data->regmap, kSAI_FIFOErrorFlag);
+
 	/* enable error interrupt */
 	SAI_TX_RX_ENABLE_DISABLE_IRQ(dir, data->regmap,
 				     kSAI_FIFOErrorInterruptEnable, true);
@@ -904,6 +1000,94 @@ static int sai_probe(const struct device *dev)
 static int sai_remove(const struct device *dev)
 {
 	/* nothing to be done here but sadly mandatory to implement */
+	return 0;
+}
+
+int dai_nxp_sai_get_status(const struct device *dev, enum dai_dir dir,
+			   struct dai_nxp_sai_status *status)
+{
+	struct sai_data *data = dev->data;
+
+	if (status == NULL || (dir != DAI_DIR_RX && dir != DAI_DIR_TX)) {
+		return -EINVAL;
+	}
+
+	status->state = sai_get_state(dir, data);
+	status->fifo_errors = dir == DAI_DIR_RX ? data->rx_fifo_errors : data->tx_fifo_errors;
+
+	return 0;
+}
+
+int dai_nxp_sai_recover(const struct device *dev, enum dai_dir dir)
+{
+	const struct sai_config *cfg = dev->config;
+	struct sai_data *data = dev->data;
+	unsigned int key;
+	int i;
+
+	if (dir != DAI_DIR_RX && dir != DAI_DIR_TX) {
+		return -EINVAL;
+	}
+
+	key = irq_lock();
+
+	if (sai_get_state(dir, data) != DAI_STATE_ERROR) {
+		irq_unlock(key);
+		return -EPERM;
+	}
+
+	/*
+	 * The reference manual's recovery for FCONT = 0: while FEF is set
+	 * the direction discards data (RX) or sends zeros (TX), and it
+	 * resumes at the start of the next frame once FEF clears. The FIFO
+	 * must be emptied before that, and FEF being set is also what makes
+	 * emptying it legal with the direction still enabled. The
+	 * transmitter/receiver, and so the bit clock and frame sync it may
+	 * be generating, never stop.
+	 */
+	sai_tx_rx_fifo_reset(dir, data->regmap);
+
+	/* as in sai_trigger_start(): a frame of zeros so TX does not
+	 * underrun again at the very next frame
+	 */
+	if (dir == DAI_DIR_TX) {
+		for (i = 0; i < data->cfg.channels; i++) {
+			SAI_WriteData(UINT_TO_I2S(data->regmap), cfg->tx_dline, 0x0);
+		}
+	}
+
+	SAI_TX_RX_DMA_ENABLE_DISABLE(dir, data->regmap, true);
+	SAI_TX_RX_STATUS_CLEAR(dir, data->regmap, kSAI_FIFOErrorFlag);
+	SAI_TX_RX_ENABLE_DISABLE_IRQ(dir, data->regmap, kSAI_FIFOErrorInterruptEnable, true);
+
+	/* not through sai_update_state(): ERROR -> RUNNING is legal only
+	 * here, and allowing it there would let a START skip its stop
+	 */
+	if (dir == DAI_DIR_RX) {
+		data->rx_state = DAI_STATE_RUNNING;
+	} else {
+		data->tx_state = DAI_STATE_RUNNING;
+	}
+
+	irq_unlock(key);
+
+	return 0;
+}
+
+int dai_nxp_sai_set_error_callback(const struct device *dev, dai_nxp_sai_error_cb_t cb,
+				   void *user_data)
+{
+	struct sai_data *data = dev->data;
+	unsigned int key;
+
+	/* the ISR reads the pair, so it must never see a new callback with
+	 * the old user data
+	 */
+	key = irq_lock();
+	data->error_cb = cb;
+	data->error_cb_data = user_data;
+	irq_unlock(key);
+
 	return 0;
 }
 
