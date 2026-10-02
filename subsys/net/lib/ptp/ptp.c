@@ -20,6 +20,15 @@ LOG_MODULE_REGISTER(ptp, CONFIG_PTP_LOG_LEVEL);
 
 K_KERNEL_STACK_DEFINE(ptp_stack, CONFIG_PTP_STACK_SIZE);
 
+#if defined(CONFIG_PTP_SERVICE_THREAD_PRIO_CUSTOM)
+#define PTP_THREAD_PRIO CONFIG_PTP_SERVICE_THREAD_PRIO
+BUILD_ASSERT(PTP_THREAD_PRIO >= K_HIGHEST_THREAD_PRIO &&
+	     PTP_THREAD_PRIO <= K_LOWEST_APPLICATION_THREAD_PRIO,
+	     "CONFIG_PTP_SERVICE_THREAD_PRIO is not a valid thread priority");
+#else
+#define PTP_THREAD_PRIO K_PRIO_COOP(1)
+#endif
+
 static struct k_thread ptp_thread_data;
 
 static void ptp_thread(void *p1, void *p2, void *p3)
@@ -107,7 +116,7 @@ static int ptp_init(void)
 
 	tid = k_thread_create(&ptp_thread_data, ptp_stack, K_KERNEL_STACK_SIZEOF(ptp_stack),
 			      ptp_thread, NULL, NULL, NULL,
-			      K_PRIO_COOP(1), 0, K_NO_WAIT);
+			      PTP_THREAD_PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&ptp_thread_data, "PTP");
 
 	return 0;
