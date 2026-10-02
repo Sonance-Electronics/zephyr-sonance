@@ -919,6 +919,28 @@ config NET_PKT_TIMESTAMP_STACK_SIZE
 	  thread waits for timestamped TX frames and calls registered
 	  callbacks.
 
+config NET_PKT_TIMESTAMP_THREAD_PRIO_CUSTOM
+	bool "Customize the TX timestamp thread priority"
+	depends on NET_PKT_TIMESTAMP_THREAD
+	help
+	  The thread runs at K_PRIO_COOP(1) by default. The callbacks it
+	  calls can do substantial work, such as PTP sending a Follow_Up
+	  through the whole network stack, and at that priority nothing
+	  else can run until they finish. Enable this to run it at
+	  NET_PKT_TIMESTAMP_THREAD_PRIO instead.
+
+config NET_PKT_TIMESTAMP_THREAD_PRIO
+	int "Priority of the TX timestamp thread"
+	default 0
+	depends on NET_PKT_TIMESTAMP_THREAD_PRIO_CUSTOM
+	help
+	  Note that >= 0 value means preemptive thread priority, the lowest
+	  usable value is NUM_PREEMPT_PRIORITIES - 1; NUM_PREEMPT_PRIORITIES
+	  itself is reserved for the idle thread.
+	  Highest preemptive thread priority is 0.
+	  Lowest cooperative thread priority is -1.
+	  Highest cooperative thread priority is -NUM_COOP_PRIORITIES.
+
 config NET_PKT_TXTIME
 	bool "Network packet TX time support"
 	help
