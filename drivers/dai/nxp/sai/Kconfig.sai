@@ -28,6 +28,24 @@ config SAI_FIFO_WORD_SIZE
 		Use this to set the size (in bytes) of a SAI
 		FIFO word.
 
+config DAI_NXP_SAI_STOP_ON_FIFO_ERROR
+	bool "Halt a direction on a FIFO error"
+	help
+		A FIFO error (RX overrun, TX underrun) loses words from
+		the middle of a frame. The SAI resumes at the next frame,
+		but the partial frame stays in the stream, so every later
+		word lands in the wrong slot: on a multichannel stream the
+		channels are permanently swapped.
+
+		By default the driver logs the error and carries on. With
+		this option it halts the direction instead and moves it to
+		DAI_STATE_ERROR, so no misaligned data follows. The consumer
+		learns of it through dai_nxp_sai_set_error_callback() or
+		dai_nxp_sai_get_status(), re-arms its DMA, and resumes the
+		direction realigned with dai_nxp_sai_recover(), which keeps
+		any bit clock and frame sync it generates running. A stop
+		and restart also realigns it, but stops those clocks.
+
 config SAI_IMX93_ERRATA_051421
 	bool "Set if your SAI IP version is affected by i.MX93's ERRATA 051421"
 	default n
