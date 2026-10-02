@@ -9,13 +9,31 @@
 #include <zephyr/kernel.h>
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/pm/device.h>
+#include <zephyr/logging/log.h>
+
+/* must precede sai.h, whose inline helpers log */
+LOG_MODULE_REGISTER(nxp_dai_sai, CONFIG_DAI_LOG_LEVEL);
 
 #include "sai.h"
 
 /* used for binding the driver */
 #define DT_DRV_COMPAT nxp_dai_sai
 
-#define SAI_TX_RX_HW_DISABLE_TIMEOUT 50
+/*
+ * How long to wait for the transmitter/receiver to actually go down.
+ *
+ * The hardware only clears its enable bit at the end of the frame it is
+ * in, so the wait has to cover a whole frame period. This was a flat
+ * 50 us, which is already less than three frames at 44.1 kHz (22.7 us
+ * each) and a fraction of one at the lower rates the hardware supports --
+ * 125 us at 8 kHz -- so a stop could time out simply because the frame
+ * had not finished.
+ *
+ * Allow four frames at the configured rate, with a floor for the fast
+ * rates and for the case where no rate has been configured yet.
+ */
+#define SAI_TX_RX_HW_DISABLE_TIMEOUT_US(rate)\
+	((rate) != 0U ? CLAMP((4U * 1000000U) / (rate), 100U, 20000U) : 20000U)
 
 /* TODO list:
  *
@@ -87,6 +105,26 @@ static int sai_mclk_config(const struct device *dev,
 }
 #endif /* CONFIG_SAI_HAS_MCLK_CONFIG_OPTION */
 
+/*
+ * Minimum gap between FIFO error reports, per direction.
+ *
+ * The error flag can be raised on every frame, so one stall becomes a
+ * flood: an RX ring left undrained for 9 ms produced 237 of these, which
+ * is 1.25 s of output on a 115200 console -- the log becomes a far bigger
+ * problem than the event it describes, and on a shared console it looks
+ * like the system has hung. 100 ms collapses a burst into a single line
+ * while still separating events a tenth of a second apart.
+ *
+ * The limit is kept per call site, so TX and RX are limited independently
+ * but every SAI instance shares each one. The count of what was held back
+ * prints as "Skipped N messages" just before the next report, so a burst
+ * that ends mid-interval goes unreported until the next error.
+ *
+ * With CONFIG_LOG_RATELIMIT=n these warnings follow
+ * CONFIG_LOG_RATELIMIT_FALLBACK, whose default drops them entirely.
+ */
+#define SAI_FIFO_ERROR_REPORT_MS 100U
+
 void sai_isr(const void *parameter)
 {
 	const struct device *dev;
@@ -97,13 +135,13 @@ void sai_isr(const void *parameter)
 
 	/* check for TX FIFO error */
 	if (SAI_TX_RX_STATUS_IS_SET(DAI_DIR_TX, data->regmap, kSAI_FIFOErrorFlag)) {
-		LOG_WRN("FIFO underrun detected");
+		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO underrun detected");
 		SAI_TX_RX_STATUS_CLEAR(DAI_DIR_TX, data->regmap, kSAI_FIFOErrorFlag);
 	}
 
 	/* check for RX FIFO error */
 	if (SAI_TX_RX_STATUS_IS_SET(DAI_DIR_RX, data->regmap, kSAI_FIFOErrorFlag)) {
-		LOG_WRN("FIFO overrun detected");
+		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO overrun detected");
 		SAI_TX_RX_STATUS_CLEAR(DAI_DIR_RX, data->regmap, kSAI_FIFOErrorFlag);
 	}
 }
@@ -217,6 +255,18 @@ static int sai_config_set(const struct device *dev,
 
 	if (cfg->type != DAI_IMX_SAI) {
 		LOG_ERR("wrong DAI type: %d", cfg->type);
+		return -EINVAL;
+	}
+
+	/*
+	 * struct sai_bespoke_config has to match SOF's
+	 * sof_ipc_dai_sai_params exactly, so a caller built against a
+	 * different version of it would be silently misread field by field.
+	 * Reject anything too short rather than reading past the end of it.
+	 */
+	if (size < sizeof(struct sai_bespoke_config)) {
+		LOG_ERR("bespoke config too small: %zu, need %zu",
+			size, sizeof(struct sai_bespoke_config));
 		return -EINVAL;
 	}
 
@@ -477,7 +527,8 @@ static bool sai_dir_disable(struct sai_data *data, enum dai_dir dir)
 	 * or not.
 	 */
 	return WAIT_FOR(!SAI_TX_RX_IS_HW_ENABLED(dir, data->regmap),
-			SAI_TX_RX_HW_DISABLE_TIMEOUT, k_busy_wait(1));
+			SAI_TX_RX_HW_DISABLE_TIMEOUT_US(data->cfg.rate),
+			k_busy_wait(1));
 }
 
 static int sai_tx_rx_disable(struct sai_data *data,
@@ -563,7 +614,21 @@ static int sai_trigger_pause(const struct device *dev,
 
 	ret = sai_tx_rx_disable(data, cfg, dir);
 	if (ret < 0) {
-		return ret;
+		/*
+		 * As in sai_trigger_stop(): the disable has already been
+		 * requested and only the wait for the hardware to follow
+		 * timed out, so finish the teardown rather than returning
+		 * with the direction still marked enabled and its data line
+		 * still unmasked while the state claims PAUSED. A resume
+		 * would otherwise re-enable a direction that was never taken
+		 * down.
+		 *
+		 * PAUSED is kept, unlike the stop path. It still permits both
+		 * RUNNING and STOPPING, so there is no dead end to recover
+		 * from, and forcing another state would discard the pause the
+		 * caller asked for.
+		 */
+		LOG_ERR("timed out disabling dir %d while pausing", dir);
 	}
 
 	/* disable TX/RX data line */
@@ -572,7 +637,7 @@ static int sai_trigger_pause(const struct device *dev,
 	/* update the software state of TX/RX */
 	sai_tx_rx_sw_enable_disable(dir, data, false);
 
-	return 0;
+	return ret;
 }
 
 static int sai_trigger_stop(const struct device *dev,
@@ -580,7 +645,7 @@ static int sai_trigger_stop(const struct device *dev,
 {
 	struct sai_data *data;
 	const struct sai_config *cfg;
-	int ret;
+	int ret, pm_ret;
 	uint32_t old_state;
 
 	data = dev->data;
@@ -612,7 +677,25 @@ static int sai_trigger_stop(const struct device *dev,
 
 	ret = sai_tx_rx_disable(data, cfg, dir);
 	if (ret < 0) {
-		return ret;
+		/*
+		 * The disable has already been requested -- sai_dir_disable()
+		 * writes the register and only the wait for the hardware to
+		 * follow timed out -- so finish the teardown rather than
+		 * bailing out half done.
+		 *
+		 * Returning here left the direction in STOPPING with its FIFO
+		 * error interrupt still enabled. There is no transition out of
+		 * STOPPING except a completed stop, so every later stop was
+		 * refused with -EPERM and the direction could never be
+		 * recovered; meanwhile a receiver still clocking raised a FIFO
+		 * error every frame, indefinitely. One timeout thus turned a
+		 * running stream into a dead one that could not be restarted.
+		 *
+		 * Force the direction to READY so a caller can retry, and
+		 * still report the failure.
+		 */
+		LOG_ERR("timed out disabling dir %d, forcing it to READY", dir);
+		sai_update_state(dir, data, DAI_STATE_READY);
 	}
 
 	/* update the software state of TX/RX */
@@ -631,7 +714,13 @@ out_dmareq_disable:
 
 	irq_disable(cfg->irq);
 
-	return pm_device_runtime_put(dev);
+	/*
+	 * The teardown above has to happen on the failure path too, so a
+	 * disable timeout is only reported once it is complete.
+	 */
+	pm_ret = pm_device_runtime_put(dev);
+
+	return ret < 0 ? ret : pm_ret;
 }
 
 /* notes:
@@ -831,22 +920,24 @@ static int sai_clks_enable_disable(const struct device *dev, bool enable)
 {
 	int i, ret;
 	const struct sai_config *cfg;
+	const struct device *clk_dev;
 	void *clk_id;
 
 	cfg = dev->config;
 
 	for (i = 0; i < cfg->clk_data.clock_num; i++) {
-		clk_id = UINT_TO_POINTER(cfg->clk_data.clocks[i]);
+		clk_dev = cfg->clk_data.clocks[i].dev;
+		clk_id = UINT_TO_POINTER(cfg->clk_data.clocks[i].id);
 
 		if (enable) {
-			ret = clock_control_on(cfg->clk_data.dev, clk_id);
+			ret = clock_control_on(clk_dev, clk_id);
 		} else {
-			ret = clock_control_off(cfg->clk_data.dev, clk_id);
+			ret = clock_control_off(clk_dev, clk_id);
 		}
 
 		if (ret < 0) {
 			LOG_ERR("failed to gate/ungate clock %u: %d",
-				cfg->clk_data.clocks[i], ret);
+				cfg->clk_data.clocks[i].id, ret);
 			return ret;
 		}
 	}
