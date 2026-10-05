@@ -309,18 +309,13 @@ struct ptp_msg *ptp_msg_from_pkt(struct net_pkt *pkt)
 
 void ptp_msg_pre_send(struct ptp_msg *msg)
 {
-	int64_t current;
-
 	msg_header_pre_send(&msg->header);
 
 	switch (ptp_msg_type(msg)) {
 	case PTP_MSG_SYNC:
 		break;
 	case PTP_MSG_DELAY_REQ:
-		current = k_uptime_get();
-
-		msg->timestamp.host.second = (uint64_t)(current / MSEC_PER_SEC);
-		msg->timestamp.host.nanosecond = (current % MSEC_PER_SEC) * NSEC_PER_MSEC;
+		msg->timestamp.sent_ms = k_uptime_get();
 		break;
 	case PTP_MSG_PDELAY_REQ:
 		break;
