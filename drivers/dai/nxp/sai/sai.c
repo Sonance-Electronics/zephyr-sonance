@@ -38,11 +38,11 @@ LOG_MODULE_REGISTER(nxp_dai_sai, CONFIG_DAI_LOG_LEVEL);
 /* TODO list:
  *
  * 1) No busy waiting should be performed in any of the operations.
- * In the case of STOP(), the operation should be split into TRIGGER_STOP
- * and TRIGGER_POST_STOP. (SOF)
- *
- * 2) Transmitter/receiver may remain enabled after sai_tx_rx_disable().
- * Fix this.
+ * STOP waits for TE/RE to clear and POST_STOP for BCE, each for up to a
+ * few frames. STOP could return at once and leave its wait to POST_STOP,
+ * but callers need not send POST_STOP, so START and config_set() would
+ * then have to cope with a direction whose TE/RE has not cleared yet.
+ * (SOF)
  */
 
 #ifdef CONFIG_SAI_HAS_MCLK_CONFIG_OPTION
@@ -553,14 +553,12 @@ static int sai_config_set(const struct device *dev,
  * waiting should be removed altogether and the HW state check should
  * be performed in sai_trigger_start() or in sai_config_set().
  *
- * TODO: seems like the transmitter still remains active (even if 1ms
- * has passed after doing a sai_trigger_stop()!). Most likely this is
- * because sai_trigger_stop() immediately stops the data line w/o
- * checking the HW state of the transmitter/receiver. As such, to get
- * rid of the busy waiting, the STOP operation may have to be split into
- * 2 operations: TRIG_STOP and TRIG_POST_STOP.
+ * With @bclk this disables the bit clock rather than the transmitter/
+ * receiver. A transmitter/receiver that provides the bit clock keeps
+ * driving it after a STOP, until POST_STOP disables it here; see
+ * sai_tx_rx_force_disable().
  */
-static bool sai_dir_disable(struct sai_data *data, enum dai_dir dir)
+static bool sai_dir_disable(struct sai_data *data, enum dai_dir dir, bool bclk)
 {
 	/* VERY IMPORTANT: DO NOT use SAI_TxEnable/SAI_RxEnable
 	 * here as they do not disable the ASYNC direction.
@@ -568,7 +566,7 @@ static bool sai_dir_disable(struct sai_data *data, enum dai_dir dir)
 	 * is not disabled before the SYNC direction, we can force
 	 * the disablement of the given direction.
 	 */
-	sai_tx_rx_force_disable(dir, data->regmap);
+	sai_tx_rx_force_disable(dir, data->regmap, bclk);
 
 	/* please note the difference between the transmitter/receiver's
 	 * hardware states and their software states. The software
@@ -579,13 +577,13 @@ static bool sai_dir_disable(struct sai_data *data, enum dai_dir dir)
 	 * indicates if the transmitter/receiver was actually disabled
 	 * or not.
 	 */
-	return WAIT_FOR(!SAI_TX_RX_IS_HW_ENABLED(dir, data->regmap),
-			SAI_TX_RX_HW_DISABLE_TIMEOUT_US(data->cfg.rate),
-			k_busy_wait(1));
+	return WAIT_FOR(bclk ? !SAI_TX_RX_IS_BCLK_ENABLED(dir, data->regmap)
+			     : !SAI_TX_RX_IS_HW_ENABLED(dir, data->regmap),
+			SAI_TX_RX_HW_DISABLE_TIMEOUT_US(data->cfg.rate), k_busy_wait(1));
 }
 
-static int sai_tx_rx_disable(struct sai_data *data,
-			     const struct sai_config *cfg, enum dai_dir dir)
+static int sai_tx_rx_disable(struct sai_data *data, const struct sai_config *cfg, enum dai_dir dir,
+			     bool bclk)
 {
 	enum dai_dir sync_dir, async_dir;
 	bool ret;
@@ -600,7 +598,7 @@ static int sai_tx_rx_disable(struct sai_data *data,
 
 	if (cfg->tx_sync_mode == kSAI_ModeAsync &&
 	    cfg->rx_sync_mode == kSAI_ModeAsync) {
-		ret = sai_dir_disable(data, dir);
+		ret = sai_dir_disable(data, dir, bclk);
 		if (!ret) {
 			LOG_ERR("timed out while waiting for dir %d disable", dir);
 			return -ETIMEDOUT;
@@ -610,7 +608,7 @@ static int sai_tx_rx_disable(struct sai_data *data,
 		async_dir = SAI_TX_RX_GET_ASYNC_DIR(cfg);
 
 		if (dir == sync_dir) {
-			ret = sai_dir_disable(data, sync_dir);
+			ret = sai_dir_disable(data, sync_dir, bclk);
 			if (!ret) {
 				LOG_ERR("timed out while waiting for dir %d disable",
 					sync_dir);
@@ -618,7 +616,7 @@ static int sai_tx_rx_disable(struct sai_data *data,
 			}
 
 			if (!SAI_TX_RX_DIR_IS_SW_ENABLED(async_dir, data)) {
-				ret = sai_dir_disable(data, async_dir);
+				ret = sai_dir_disable(data, async_dir, bclk);
 				if (!ret) {
 					LOG_ERR("timed out while waiting for dir %d disable",
 						async_dir);
@@ -627,7 +625,7 @@ static int sai_tx_rx_disable(struct sai_data *data,
 			}
 		} else {
 			if (!SAI_TX_RX_DIR_IS_SW_ENABLED(sync_dir, data)) {
-				ret = sai_dir_disable(data, async_dir);
+				ret = sai_dir_disable(data, async_dir, bclk);
 				if (!ret) {
 					LOG_ERR("timed out while waiting for dir %d disable",
 						async_dir);
@@ -665,7 +663,7 @@ static int sai_trigger_pause(const struct device *dev,
 
 	LOG_DBG("pause on direction %d", dir);
 
-	ret = sai_tx_rx_disable(data, cfg, dir);
+	ret = sai_tx_rx_disable(data, cfg, dir, false);
 	if (ret < 0) {
 		/*
 		 * As in sai_trigger_stop(): the disable has already been
@@ -728,7 +726,7 @@ static int sai_trigger_stop(const struct device *dev,
 		goto out_dmareq_disable;
 	}
 
-	ret = sai_tx_rx_disable(data, cfg, dir);
+	ret = sai_tx_rx_disable(data, cfg, dir, false);
 	if (ret < 0) {
 		/*
 		 * The disable has already been requested -- sai_dir_disable()
@@ -837,6 +835,66 @@ static void sai_tx_rx_sw_reset(struct sai_data *data,
 	}
 }
 
+/*
+ * Stop the bit clock that STOP leaves running (see
+ * sai_tx_rx_force_disable()). The DAI API stops clocks here rather than at
+ * STOP so that a downstream codec clocked from BCLK can be shut down first.
+ *
+ * Only a stopped direction is accepted. In synchronous mode this follows
+ * the same rules as the STOP path: the ASYNC direction's bit clock, which
+ * both directions use, is only stopped once the SYNC direction is not
+ * enabled.
+ */
+static int sai_trigger_post_stop(const struct device *dev, enum dai_dir dir)
+{
+	struct sai_data *data;
+	const struct sai_config *cfg;
+	enum pm_device_state pm_state;
+	enum dai_state state;
+	int ret, pm_ret;
+
+	data = dev->data;
+	cfg = dev->config;
+
+	if (dir != DAI_DIR_RX && dir != DAI_DIR_TX) {
+		LOG_ERR("invalid direction: %d", dir);
+		return -EINVAL;
+	}
+
+	/* a completed STOP leaves the direction in STOPPING, or READY if
+	 * the disable timed out
+	 */
+	state = sai_get_state(dir, data);
+	if (state != DAI_STATE_STOPPING && state != DAI_STATE_READY) {
+		LOG_ERR("POST_STOP on dir %d needs it stopped, state is %d", dir, state);
+		return -EPERM;
+	}
+
+	/*
+	 * A suspended SAI has its clocks gated, so its bit clock is already
+	 * stopped. Resuming it just to clear BCE would restart BCLK until the
+	 * clear took effect at the end of the frame.
+	 */
+	ret = pm_device_state_get(dev, &pm_state);
+	if (ret == 0 && pm_state == PM_DEVICE_STATE_SUSPENDED) {
+		return 0;
+	}
+
+	ret = pm_device_runtime_get(dev);
+	if (ret < 0) {
+		LOG_ERR("failed to get() SAI device: %d", ret);
+		return ret;
+	}
+
+	LOG_DBG("post-stop on direction %d", dir);
+
+	ret = sai_tx_rx_disable(data, cfg, dir, true);
+
+	pm_ret = pm_device_runtime_put(dev);
+
+	return ret < 0 ? ret : pm_ret;
+}
+
 static int sai_trigger_start(const struct device *dev,
 			     enum dai_dir dir)
 {
@@ -933,6 +991,8 @@ static int sai_trigger(const struct device *dev,
 		return sai_trigger_pause(dev, dir);
 	case DAI_TRIGGER_STOP:
 		return sai_trigger_stop(dev, dir);
+	case DAI_TRIGGER_POST_STOP:
+		return sai_trigger_post_stop(dev, dir);
 	case DAI_TRIGGER_PRE_START:
 	case DAI_TRIGGER_COPY:
 		/* COPY and PRE_START don't require the SAI

@@ -212,6 +212,11 @@
 	((dir) == DAI_DIR_RX ? (UINT_TO_I2S(regmap)->RCSR & I2S_RCSR_RE_MASK) : \
 	 (UINT_TO_I2S(regmap)->TCSR & I2S_TCSR_TE_MASK))
 
+/* used to check if the transmitter/receiver's bit clock is enabled */
+#define SAI_TX_RX_IS_BCLK_ENABLED(dir, regmap)                                                     \
+	((dir) == DAI_DIR_RX ? (UINT_TO_I2S(regmap)->RCSR & I2S_RCSR_BCE_MASK)                     \
+			     : (UINT_TO_I2S(regmap)->TCSR & I2S_TCSR_BCE_MASK))
+
 /* used to enable various transmitter/receiver interrupts */
 #define _SAI_TX_RX_ENABLE_IRQ(dir, regmap, which)\
 	((dir) == DAI_DIR_RX ? SAI_RxEnableInterrupts(UINT_TO_I2S(regmap), which) : \
@@ -549,15 +554,26 @@ static int sai_update_state(enum dai_dir dir,
 	return ret;
 }
 
-static inline void sai_tx_rx_force_disable(enum dai_dir dir,
-					   uint32_t regmap)
+/* Disable a direction or, with @bclk, its bit clock.
+ *
+ * Setting TE/RE also sets BCE, but clearing TE/RE leaves BCE set, so a
+ * direction that provides the bit clock carries on driving BCLK after it
+ * has been disabled -- observed on an i.MX RT1176, where BCLK still ran at
+ * its full rate 1 ms after RE had read back 0. STOP and PAUSE rely on
+ * that: the DAI API keeps the clocks running until POST_STOP, since a
+ * codec that derives its clocks from BCLK treats losing them as a fault.
+ * POST_STOP clears BCE with @bclk once TE/RE are already clear.
+ */
+static inline void sai_tx_rx_force_disable(enum dai_dir dir, uint32_t regmap, bool bclk)
 {
 	I2S_Type *base = UINT_TO_I2S(regmap);
 
 	if (dir == DAI_DIR_RX) {
-		base->RCSR = ((base->RCSR & 0xFFE3FFFFU) & (~I2S_RCSR_RE_MASK));
+		base->RCSR =
+			(base->RCSR & 0xFFE3FFFFU) & ~(bclk ? I2S_RCSR_BCE_MASK : I2S_RCSR_RE_MASK);
 	} else {
-		base->TCSR = ((base->TCSR & 0xFFE3FFFFU) & (~I2S_TCSR_TE_MASK));
+		base->TCSR =
+			(base->TCSR & 0xFFE3FFFFU) & ~(bclk ? I2S_TCSR_BCE_MASK : I2S_TCSR_TE_MASK);
 	}
 }
 
