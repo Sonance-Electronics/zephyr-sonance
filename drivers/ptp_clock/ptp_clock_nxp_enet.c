@@ -156,6 +156,14 @@ static void ptp_clock_nxp_enet_set_correction(ENET_Type *base, uint32_t corr,
  * pair -- bounded by the 7-bit INC_CORR field -- that best approximates it.
  * This bakes the truncation-bias cancellation into every call instead of a
  * separate one-time fix the servo can throw away.
+ *
+ * The search runs over the step corr - INC, taking for each the period that
+ * best realizes the required ns/tick, up to the 31-bit ATCOR limit. Periods
+ * were once capped at the INC_CORR maximum, 127. That suits a source whose
+ * tick is not a whole number of ns, where holding the nominal rate needs a
+ * short period anyway. For one whose tick is, such as 25 MHz, it made the
+ * smallest non-zero adjustment 1/127 ns per tick, about 200 ppm; a step of
+ * 1 ns every N ticks reaches a resolution of well under 1 ppm.
  */
 static int ptp_clock_nxp_enet_rate_adjust(const struct device *dev,
 					double ratio)
@@ -165,12 +173,14 @@ static int ptp_clock_nxp_enet_rate_adjust(const struct device *dev,
 	uint32_t clk_hz;
 	uint32_t hw_inc;
 	uint32_t corr_max = ENET_ATINC_INC_CORR_MASK >> ENET_ATINC_INC_CORR_SHIFT;
+	/* ATCOR holds period - 1; see ptp_clock_nxp_enet_set_correction(). */
+	double period_max = (double)(ENET_ATCOR_COR_MASK >> ENET_ATCOR_COR_SHIFT) + 1.0;
 	double target;
 	double delta;
-	double best_err = -1.0;
+	double best_err;
 	uint32_t best_period = 0;
-	int32_t best_corr = 0;
-	uint32_t period;
+	int32_t best_corr;
+	int32_t step;
 
 	(void) clock_control_get_rate(config->clock_dev, config->clock_subsys,
 				&clk_hz);
@@ -189,35 +199,47 @@ static int ptp_clock_nxp_enet_rate_adjust(const struct device *dev,
 	 */
 	delta = target * ratio - (double)hw_inc;
 
-	/* From 2: see ptp_clock_nxp_enet_set_correction(). */
-	for (period = 2; period <= corr_max; period++) {
-		int32_t corr = (int32_t)hw_inc +
-			(int32_t)floor(delta * period + 0.5);
-		double err;
+	/* Start from no correction at all, which is exact when delta is 0. */
+	best_corr = (int32_t)hw_inc;
+	best_err = fabs(delta);
+
+	/*
+	 * Each correction moves the timer by the step at once, so prefer the
+	 * smallest step within the same 0.01 ppm treated as no change above.
+	 */
+	for (step = 1; delta != 0.0 && best_err > target * 0.00000001; step++) {
+		int32_t s = delta > 0.0 ? step : -step;
+		int32_t corr = (int32_t)hw_inc + s;
+		/* The real period realizing delta exactly; s and delta share a sign. */
+		double ideal = (double)s / delta;
+		double candidates[2] = { floor(ideal), ceil(ideal) };
 
 		if (corr < 0 || corr > (int32_t)corr_max) {
-			continue;
+			break;
 		}
 
-		err = fabs((double)(corr - (int32_t)hw_inc) / period - delta);
+		ARRAY_FOR_EACH(candidates, i) {
+			/* From 2: see ptp_clock_nxp_enet_set_correction(). */
+			double period = CLAMP(candidates[i], 2.0, period_max);
+			double err = fabs((double)s / period - delta);
 
-		if (best_period == 0 || err < best_err) {
-			best_period = period;
-			best_corr = corr;
-			best_err = err;
+			if (err < best_err) {
+				best_period = (uint32_t)period;
+				best_corr = corr;
+				best_err = err;
+			}
 		}
-	}
-
-	if (best_period == 0) {
-		/* delta is always small (truncation remainder plus a tiny PI
-		 * trim); this should not happen in practice.
-		 */
-		return -EINVAL;
 	}
 
 	k_mutex_lock(&data->ptp_mutex, K_FOREVER);
 
-	ptp_clock_nxp_enet_set_correction(data->base, (uint32_t)best_corr, best_period);
+	if (best_period == 0) {
+		/* COR = 0 disables correction. */
+		ENET_Ptp1588AdjustTimer(data->base, hw_inc, 0U);
+	} else {
+		ptp_clock_nxp_enet_set_correction(data->base, (uint32_t)best_corr,
+						  best_period);
+	}
 
 	k_mutex_unlock(&data->ptp_mutex);
 
