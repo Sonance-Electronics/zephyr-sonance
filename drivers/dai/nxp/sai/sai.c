@@ -20,7 +20,8 @@ LOG_MODULE_REGISTER(nxp_dai_sai, CONFIG_DAI_LOG_LEVEL);
 #define DT_DRV_COMPAT nxp_dai_sai
 
 /*
- * How long to wait for the transmitter/receiver to actually go down.
+ * How long to wait for the transmitter/receiver to actually go down; see
+ * sai_tx_rx_wait_disabled().
  *
  * The hardware only clears its enable bit at the end of the frame it is
  * in, so the wait has to cover a whole frame period. This was a flat
@@ -38,11 +39,12 @@ LOG_MODULE_REGISTER(nxp_dai_sai, CONFIG_DAI_LOG_LEVEL);
 /* TODO list:
  *
  * 1) No busy waiting should be performed in any of the operations.
- * STOP waits for TE/RE to clear and POST_STOP for BCE, each for up to a
- * few frames. STOP could return at once and leave its wait to POST_STOP,
- * but callers need not send POST_STOP, so START and config_set() would
- * then have to cope with a direction whose TE/RE has not cleared yet.
- * (SOF)
+ * STOP, PAUSE and POST_STOP do not wait while the SAI provides the bit
+ * clock, but START and config_set() do when they follow a STOP within the
+ * frame it was issued in: see sai_tx_rx_wait_disabled(). Removing that
+ * wait would mean returning -EBUSY instead, which every caller would have
+ * to retry on. With an external bit clock STOP and PAUSE still wait; see
+ * sai_tx_rx_disable(). (SOF)
  */
 
 #ifdef CONFIG_SAI_HAS_MCLK_CONFIG_OPTION
@@ -160,12 +162,11 @@ static bool sai_fifo_error(const struct device *dev, enum dai_dir dir)
 
 	if (IS_ENABLED(CONFIG_DAI_NXP_SAI_STOP_ON_FIFO_ERROR) &&
 	    sai_update_state(dir, data, DAI_STATE_ERROR) == 0) {
-		SAI_TX_RX_DMA_ENABLE_DISABLE(dir, data->regmap, false);
-		SAI_TX_RX_ENABLE_DISABLE_IRQ(dir, data->regmap, kSAI_FIFOErrorInterruptEnable,
-					     false);
+		sai_tx_rx_dma_enable(data, dir, false);
+		sai_tx_rx_irq_enable(data, dir, kSAI_FIFOErrorInterruptEnable, false);
 		halted = true;
 	} else {
-		SAI_TX_RX_STATUS_CLEAR(dir, data->regmap, kSAI_FIFOErrorFlag);
+		sai_tx_rx_status_clear(data, dir, kSAI_FIFOErrorFlag);
 	}
 
 	if (data->error_cb != NULL) {
@@ -295,6 +296,116 @@ static void sai_config_set_err_051421(I2S_Type *base,
 	}
 }
 #endif /* CONFIG_SAI_IMX93_ERRATA_051421 */
+
+/* The directions an operation on @dir acts on, as a mask of BIT(dir).
+ *
+ *	1) The "rx_sync_mode" and "tx_sync_mode" properties force the user to pick from
+ *	SYNC and ASYNC for each direction. As such, there are 4 possible combinations
+ *	that need to be covered here:
+ *		a) TX ASYNC, RX ASYNC
+ *		b) TX SYNC, RX ASYNC
+ *		c) TX ASYNC, RX SYNC
+ *		d) TX SYNC, RX SYNC
+ *
+ *	Combination d) is not valid and is covered by a BUILD_ASSERT(). As such, there are 3 valid
+ *	combinations that need to be supported. In combination a) an operation only acts on the
+ *	target direction, so there's only combinations b) and c) to be covered.
+ *
+ *	2) We can distinguish between 3 types of directions:
+ *		a) The target direction. This is the direction on which we want to perform the
+ *		operation: a disable, a wait for one, or a software reset.
+ *		b) The SYNC direction. This is, well, the direction that's in SYNC with the other
+ *		direction.
+ *		c) The ASYNC direction.
+ *
+ *	Of course, the target direction may differ from the SYNC or ASYNC directions, but it
+ *	can't differ from both of them at the same time (i.e: TARGET != SYNC AND TARGET != ASYNC).
+ *
+ *	If the target direction is the same as the SYNC direction then we can safely act on the
+ *	target direction as there's nothing depending on it. We also want to act on the ASYNC
+ *	direction. We can only do this if the ASYNC direction wasn't software enabled (i.e:
+ *	through an explicit trigger_start() call).
+ *
+ *	If the target direction is the same as the ASYNC direction then we can only act on it
+ *	if the SYNC direction wasn't software enabled (i.e: through an explicit trigger_start()
+ *	call).
+ */
+static uint32_t sai_tx_rx_dirs(struct sai_data *data, const struct sai_config *cfg,
+			       enum dai_dir dir)
+{
+	enum dai_dir sync_dir, async_dir;
+
+	if (cfg->tx_sync_mode == kSAI_ModeAsync && cfg->rx_sync_mode == kSAI_ModeAsync) {
+		return BIT(dir);
+	}
+
+	sync_dir = SAI_TX_RX_GET_SYNC_DIR(cfg);
+	async_dir = SAI_TX_RX_GET_ASYNC_DIR(cfg);
+
+	if (dir == sync_dir) {
+		return BIT(sync_dir) |
+		       (SAI_TX_RX_DIR_IS_SW_ENABLED(async_dir, data) ? 0U : BIT(async_dir));
+	}
+
+	return SAI_TX_RX_DIR_IS_SW_ENABLED(sync_dir, data) ? 0U : BIT(async_dir);
+}
+
+/* Wait for disables requested by sai_tx_rx_disable() to take effect, on
+ * the directions in @dirs.
+ *
+ * The hardware only clears TE/RE at the end of the current frame. This
+ * costs nothing when a direction is already down, which it is unless the
+ * caller follows a STOP within the frame it was issued in; it then waits
+ * out the rest of that frame.
+ *
+ * The timeout starts here rather than at the disable request, so a frame
+ * that could not finish because its clock was stopped in between, e.g.
+ * while the clock source was being reprogrammed or runtime PM had gated
+ * the SAI, is still given a full timeout once the clock runs again.
+ *
+ * START and config_set() carry on after a timeout, with a warning, as they
+ * did before they waited at all: a frame that never ends means its bit
+ * clock has stopped, typically an external one whose provider only starts
+ * it again once the stream does, so failing would leave the DAI stuck.
+ *
+ * please note the difference between the transmitter/receiver's
+ * hardware states and their software states. The software
+ * states can be obtained by reading data->tx/rx_enabled, while
+ * the hardware states can be obtained by reading TCSR/RCSR. The
+ * hardware state can actually differ from the software state.
+ * Here, we're interested in reading the hardware state which
+ * indicates if the transmitter/receiver was actually disabled
+ * or not.
+ */
+static int sai_tx_rx_wait_disabled(struct sai_data *data, uint32_t dirs)
+{
+	for (enum dai_dir dir = DAI_DIR_TX; dir <= DAI_DIR_RX; dir++) {
+		if ((dirs & BIT(dir)) == 0U) {
+			continue;
+		}
+
+		if (!WAIT_FOR(!SAI_TX_RX_IS_HW_ENABLED(dir, data->regmap),
+			      SAI_TX_RX_HW_DISABLE_TIMEOUT_US(data->cfg.rate), k_busy_wait(1))) {
+			LOG_WRN("dir %d still enabled after %u us", dir,
+				SAI_TX_RX_HW_DISABLE_TIMEOUT_US(data->cfg.rate));
+			return -ETIMEDOUT;
+		}
+	}
+
+	return 0;
+}
+
+static int sai_pm_get(const struct device *dev)
+{
+	int ret;
+
+	ret = pm_device_runtime_get(dev);
+	if (ret < 0) {
+		LOG_ERR("failed to get() SAI device: %d", ret);
+	}
+
+	return ret;
+}
 
 static int sai_config_set(const struct device *dev,
 			  const struct dai_config *cfg,
@@ -478,10 +589,18 @@ static int sai_config_set(const struct device *dev,
 	tx_config->syncMode = sai_cfg->tx_sync_mode;
 	rx_config->syncMode = sai_cfg->rx_sync_mode;
 
-	ret = pm_device_runtime_get(dev);
+	ret = sai_pm_get(dev);
 	if (ret < 0) {
-		LOG_ERR("failed to get() SAI device: %d", ret);
 		return ret;
+	}
+
+	/* the configuration cannot be changed while either direction is
+	 * still enabled, and a STOP issued in the current frame may not have
+	 * taken effect yet. This runs before data->cfg.rate changes, as the
+	 * frame still finishing is at the old rate.
+	 */
+	if (sai_tx_rx_wait_disabled(data, BIT(DAI_DIR_TX) | BIT(DAI_DIR_RX)) < 0) {
+		LOG_WRN("configuring anyway");
 	}
 
 	/* commit configuration */
@@ -547,95 +666,88 @@ static int sai_config_set(const struct device *dev,
 	return pm_device_runtime_put(dev);
 }
 
-/* SOF note: please be very careful with this function as it does
- * busy waiting and may mess up your timing in time critical applications
- * (especially with timer domain). If this becomes unusable, the busy
- * waiting should be removed altogether and the HW state check should
- * be performed in sai_trigger_start() or in sai_config_set().
+/* True if the bit clock that @dir runs from comes from outside the SAI.
  *
- * With @bclk this disables the bit clock rather than the transmitter/
- * receiver. A transmitter/receiver that provides the bit clock keeps
- * driving it after a STOP, until POST_STOP disables it here; see
- * sai_tx_rx_force_disable().
+ * This reads the bit clock direction (xCR2.BCD) the hardware is actually
+ * configured with, from the direction that provides the clock: in
+ * synchronous mode that is the ASYNC direction. The cached transceiver
+ * configuration can disagree with the hardware after a config_set() that
+ * failed part way through.
  */
-static bool sai_dir_disable(struct sai_data *data, enum dai_dir dir, bool bclk)
+static bool sai_tx_rx_bclk_is_external(struct sai_data *data, const struct sai_config *cfg,
+				       enum dai_dir dir)
 {
-	/* VERY IMPORTANT: DO NOT use SAI_TxEnable/SAI_RxEnable
-	 * here as they do not disable the ASYNC direction.
-	 * Since the software logic assures that the ASYNC direction
-	 * is not disabled before the SYNC direction, we can force
-	 * the disablement of the given direction.
-	 */
-	sai_tx_rx_force_disable(dir, data->regmap, bclk);
+	I2S_Type *base = UINT_TO_I2S(data->regmap);
 
-	/* please note the difference between the transmitter/receiver's
-	 * hardware states and their software states. The software
-	 * states can be obtained by reading data->tx/rx_enabled, while
-	 * the hardware states can be obtained by reading TCSR/RCSR. The
-	 * hardware state can actually differ from the software state.
-	 * Here, we're interested in reading the hardware state which
-	 * indicates if the transmitter/receiver was actually disabled
-	 * or not.
-	 */
-	return WAIT_FOR(bclk ? !SAI_TX_RX_IS_BCLK_ENABLED(dir, data->regmap)
-			     : !SAI_TX_RX_IS_HW_ENABLED(dir, data->regmap),
-			SAI_TX_RX_HW_DISABLE_TIMEOUT_US(data->cfg.rate), k_busy_wait(1));
+	if (cfg->tx_sync_mode != kSAI_ModeAsync || cfg->rx_sync_mode != kSAI_ModeAsync) {
+		dir = SAI_TX_RX_GET_ASYNC_DIR(cfg);
+	}
+
+	return dir == DAI_DIR_RX ? (base->RCR2 & I2S_RCR2_BCD_MASK) == 0U
+				 : (base->TCR2 & I2S_TCR2_BCD_MASK) == 0U;
 }
 
-static int sai_tx_rx_disable(struct sai_data *data, const struct sai_config *cfg, enum dai_dir dir,
-			     bool bclk)
+/* Request that the directions in @dirs be disabled, by clearing @bits
+ * (SAI_CSR_XE_MASK, SAI_CSR_BCE_MASK). Without @write only record them, for
+ * a SAI suspended by runtime PM whose registers cannot be written;
+ * sai_pm_action() writes them on resume.
+ */
+static void sai_tx_rx_request_disable(struct sai_data *data, uint32_t dirs, uint32_t bits,
+				      bool write)
 {
-	enum dai_dir sync_dir, async_dir;
-	bool ret;
-
-	/* sai_disable() should never be called from ISR context
-	 * as it does some busy waiting.
-	 */
-	if (k_is_in_isr()) {
-		LOG_ERR("sai_disable() should never be called from ISR context");
-		return -EINVAL;
-	}
-
-	if (cfg->tx_sync_mode == kSAI_ModeAsync &&
-	    cfg->rx_sync_mode == kSAI_ModeAsync) {
-		ret = sai_dir_disable(data, dir, bclk);
-		if (!ret) {
-			LOG_ERR("timed out while waiting for dir %d disable", dir);
-			return -ETIMEDOUT;
+	for (enum dai_dir d = DAI_DIR_TX; d <= DAI_DIR_RX; d++) {
+		if ((dirs & BIT(d)) == 0U) {
+			continue;
 		}
-	} else {
-		sync_dir = SAI_TX_RX_GET_SYNC_DIR(cfg);
-		async_dir = SAI_TX_RX_GET_ASYNC_DIR(cfg);
 
-		if (dir == sync_dir) {
-			ret = sai_dir_disable(data, sync_dir, bclk);
-			if (!ret) {
-				LOG_ERR("timed out while waiting for dir %d disable",
-					sync_dir);
-				return -ETIMEDOUT;
-			}
-
-			if (!SAI_TX_RX_DIR_IS_SW_ENABLED(async_dir, data)) {
-				ret = sai_dir_disable(data, async_dir, bclk);
-				if (!ret) {
-					LOG_ERR("timed out while waiting for dir %d disable",
-						async_dir);
-					return -ETIMEDOUT;
-				}
-			}
+		if (write) {
+			/* VERY IMPORTANT: DO NOT use SAI_TxEnable/SAI_RxEnable
+			 * here as they do not disable the ASYNC direction.
+			 * Since the software logic assures that the ASYNC direction
+			 * is not disabled before the SYNC direction, we can force
+			 * the disablement of the given direction.
+			 */
+			sai_tx_rx_force_disable(data, d, bits);
 		} else {
-			if (!SAI_TX_RX_DIR_IS_SW_ENABLED(sync_dir, data)) {
-				ret = sai_dir_disable(data, async_dir, bclk);
-				if (!ret) {
-					LOG_ERR("timed out while waiting for dir %d disable",
-						async_dir);
-					return -ETIMEDOUT;
-				}
-			}
+			*sai_csr_off(data, d) |= bits;
+		}
+	}
+}
+
+/* Request that the directions an operation on @dir acts on be disabled.
+ *
+ * The hardware only clears TE/RE at the end of the current frame, and this
+ * does not wait for it unless the bit clock comes from outside the SAI. So
+ * STOP and PAUSE may return with the direction still running: a caller
+ * must not take the hardware to be down by then. Anything that needs a
+ * direction fully stopped -- a software reset, or a configuration change --
+ * calls sai_tx_rx_wait_disabled() first. While a disable is pending,
+ * sai_tx_rx_csr_update() keeps other register writes from cancelling it.
+ *
+ * An external bit clock is the exception. The frame can then only end
+ * while the clock provider still runs, and the RM requires an external bit
+ * clock to be "disabled after the SAI transmitter or receiver is disabled
+ * and completes its current frames". A caller that stops a codec providing
+ * the clock straight after STOP would otherwise leave TE/RE set, so with an
+ * external bit clock, wait here as STOP and PAUSE always used to.
+ *
+ * The bit clock itself keeps running; see sai_tx_rx_force_disable() and
+ * sai_trigger_post_stop().
+ */
+static int sai_tx_rx_disable(struct sai_data *data, const struct sai_config *cfg, enum dai_dir dir)
+{
+	uint32_t dirs = sai_tx_rx_dirs(data, cfg, dir);
+	uint32_t external = 0U;
+
+	sai_tx_rx_request_disable(data, dirs, SAI_CSR_XE_MASK, true);
+
+	for (enum dai_dir d = DAI_DIR_TX; d <= DAI_DIR_RX; d++) {
+		if ((dirs & BIT(d)) != 0U && sai_tx_rx_bclk_is_external(data, cfg, d)) {
+			external |= BIT(d);
 		}
 	}
 
-	return 0;
+	return sai_tx_rx_wait_disabled(data, external);
 }
 
 static int sai_trigger_pause(const struct device *dev,
@@ -663,22 +775,11 @@ static int sai_trigger_pause(const struct device *dev,
 
 	LOG_DBG("pause on direction %d", dir);
 
-	ret = sai_tx_rx_disable(data, cfg, dir, false);
+	/* with an external bit clock this waits, and a timeout leaves the
+	 * direction PAUSED: that still permits both RUNNING and STOPPING
+	 */
+	ret = sai_tx_rx_disable(data, cfg, dir);
 	if (ret < 0) {
-		/*
-		 * As in sai_trigger_stop(): the disable has already been
-		 * requested and only the wait for the hardware to follow
-		 * timed out, so finish the teardown rather than returning
-		 * with the direction still marked enabled and its data line
-		 * still unmasked while the state claims PAUSED. A resume
-		 * would otherwise re-enable a direction that was never taken
-		 * down.
-		 *
-		 * PAUSED is kept, unlike the stop path. It still permits both
-		 * RUNNING and STOPPING, so there is no dead end to recover
-		 * from, and forcing another state would discard the pause the
-		 * caller asked for.
-		 */
 		LOG_ERR("timed out disabling dir %d while pausing", dir);
 	}
 
@@ -718,119 +819,55 @@ static int sai_trigger_stop(const struct device *dev,
 
 	LOG_DBG("stop on direction %d", dir);
 
-	if (old_state == DAI_STATE_PAUSED) {
-		/* if SAI was previously paused then all that's
-		 * left to do is disable the DMA requests and
-		 * the data line.
-		 */
-		goto out_dmareq_disable;
+	if (old_state != DAI_STATE_PAUSED) {
+		/* update the software state of TX/RX */
+		sai_tx_rx_sw_enable_disable(dir, data, false);
+
+		/* disable TX/RX data line */
+		sai_tx_rx_set_dline_mask(dir, data->regmap, 0x0);
 	}
 
-	ret = sai_tx_rx_disable(data, cfg, dir, false);
+	/* disable DMA requests */
+	sai_tx_rx_dma_enable(data, dir, false);
+
+	/* disable error interrupt */
+	sai_tx_rx_irq_enable(data, dir, kSAI_FIFOErrorInterruptEnable, false);
+
+	irq_disable(cfg->irq);
+
+	/* With the SAI providing the bit clock this does not wait. The DMA
+	 * requests are already off, so whatever the direction receives in the
+	 * rest of the frame stays in the FIFO, and START's software reset
+	 * empties it: the data before STOP ends part way through a frame,
+	 * where it used to end on a whole one. After a PAUSE this requests
+	 * the disable again, which changes nothing.
+	 *
+	 * With an external bit clock it waits, and a timeout forces the
+	 * direction to READY. There is no transition out of STOPPING except
+	 * a completed stop, so a later STOP would be refused; START and
+	 * config_set() carry on regardless.
+	 */
+	ret = sai_tx_rx_disable(data, cfg, dir);
 	if (ret < 0) {
-		/*
-		 * The disable has already been requested -- sai_dir_disable()
-		 * writes the register and only the wait for the hardware to
-		 * follow timed out -- so finish the teardown rather than
-		 * bailing out half done.
-		 *
-		 * Returning here left the direction in STOPPING with its FIFO
-		 * error interrupt still enabled. There is no transition out of
-		 * STOPPING except a completed stop, so every later stop was
-		 * refused with -EPERM and the direction could never be
-		 * recovered; meanwhile a receiver still clocking raised a FIFO
-		 * error every frame, indefinitely. One timeout thus turned a
-		 * running stream into a dead one that could not be restarted.
-		 *
-		 * Force the direction to READY so a caller can retry, and
-		 * still report the failure.
-		 */
 		LOG_ERR("timed out disabling dir %d, forcing it to READY", dir);
 		sai_update_state(dir, data, DAI_STATE_READY);
 	}
 
-	/* update the software state of TX/RX */
-	sai_tx_rx_sw_enable_disable(dir, data, false);
-
-	/* disable TX/RX data line */
-	sai_tx_rx_set_dline_mask(dir, data->regmap, 0x0);
-
-out_dmareq_disable:
-	/* disable DMA requests */
-	SAI_TX_RX_DMA_ENABLE_DISABLE(dir, data->regmap, false);
-
-	/* disable error interrupt */
-	SAI_TX_RX_ENABLE_DISABLE_IRQ(dir, data->regmap,
-				     kSAI_FIFOErrorInterruptEnable, false);
-
-	irq_disable(cfg->irq);
-
-	/*
-	 * The teardown above has to happen on the failure path too, so a
-	 * disable timeout is only reported once it is complete.
+	/* with runtime PM this may gate the SAI's clocks before that frame
+	 * has finished; it then finishes once START or config_set()
+	 * resumes them, and sai_tx_rx_wait_disabled() allows for that
 	 */
 	pm_ret = pm_device_runtime_put(dev);
 
 	return ret < 0 ? ret : pm_ret;
 }
 
-/* notes:
- *	1) The "rx_sync_mode" and "tx_sync_mode" properties force the user to pick from
- *	SYNC and ASYNC for each direction. As such, there are 4 possible combinations
- *	that need to be covered here:
- *		a) TX ASYNC, RX ASYNC
- *		b) TX SYNC, RX ASYNC
- *		c) TX ASYNC, RX SYNC
- *		d) TX SYNC, RX SYNC
- *
- *	Combination d) is not valid and is covered by a BUILD_ASSERT(). As such, there are 3 valid
- *	combinations that need to be supported. Since the main branch of the IF statement covers
- *	combination a), there's only combinations b) and c) to be covered here.
- *
- *	2) We can distinguish between 3 types of directions:
- *		a) The target direction. This is the direction on which we want to perform the
- *		software reset.
- *		b) The SYNC direction. This is, well, the direction that's in SYNC with the other
- *		direction.
- *		c) The ASYNC direction.
- *
- *	Of course, the target direction may differ from the SYNC or ASYNC directions, but it
- *	can't differ from both of them at the same time (i.e: TARGET != SYNC AND TARGET != ASYNC).
- *
- *	If the target direction is the same as the SYNC direction then we can safely perform the
- *	software reset on the target direction as there's nothing depending on it. We also want
- *	to do a software reset on the ASYNC direction. We can only do this if the ASYNC direction
- *	wasn't software enabled (i.e: through an explicit trigger_start() call).
- *
- *	If the target direction is the same as the ASYNC direction then we can only perform a
- *	software reset on it only if the SYNC direction wasn't software enabled (i.e: through an
- *	explicit trigger_start() call).
- */
-static void sai_tx_rx_sw_reset(struct sai_data *data,
-			       const struct sai_config *cfg, enum dai_dir dir)
+/* software reset the directions in @dirs, from sai_tx_rx_dirs() */
+static void sai_tx_rx_sw_reset(struct sai_data *data, uint32_t dirs)
 {
-	enum dai_dir sync_dir, async_dir;
-
-	if (cfg->tx_sync_mode == kSAI_ModeAsync &&
-	    cfg->rx_sync_mode == kSAI_ModeAsync) {
-		/* both directions are ASYNC w.r.t each other. As such, do
-		 * software reset only on the targeted direction.
-		 */
-		SAI_TX_RX_SW_RESET(dir, data->regmap);
-	} else {
-		sync_dir = SAI_TX_RX_GET_SYNC_DIR(cfg);
-		async_dir = SAI_TX_RX_GET_ASYNC_DIR(cfg);
-
-		if (dir == sync_dir) {
-			SAI_TX_RX_SW_RESET(sync_dir, data->regmap);
-
-			if (!SAI_TX_RX_DIR_IS_SW_ENABLED(async_dir, data)) {
-				SAI_TX_RX_SW_RESET(async_dir, data->regmap);
-			}
-		} else {
-			if (!SAI_TX_RX_DIR_IS_SW_ENABLED(sync_dir, data)) {
-				SAI_TX_RX_SW_RESET(async_dir, data->regmap);
-			}
+	for (enum dai_dir d = DAI_DIR_TX; d <= DAI_DIR_RX; d++) {
+		if ((dirs & BIT(d)) != 0U) {
+			sai_tx_rx_dir_sw_reset(data, d);
 		}
 	}
 }
@@ -841,9 +878,10 @@ static void sai_tx_rx_sw_reset(struct sai_data *data,
  * STOP so that a downstream codec clocked from BCLK can be shut down first.
  *
  * Only a stopped direction is accepted. In synchronous mode this follows
- * the same rules as the STOP path: the ASYNC direction's bit clock, which
- * both directions use, is only stopped once the SYNC direction is not
- * enabled.
+ * the same rules as the STOP path, with one more: the other direction's
+ * bit clock is only stopped if that direction is stopped too. Its software
+ * enabled flag is not enough, as PAUSE clears it while a paused direction
+ * still needs its clock.
  */
 static int sai_trigger_post_stop(const struct device *dev, enum dai_dir dir)
 {
@@ -851,7 +889,8 @@ static int sai_trigger_post_stop(const struct device *dev, enum dai_dir dir)
 	const struct sai_config *cfg;
 	enum pm_device_state pm_state;
 	enum dai_state state;
-	int ret, pm_ret;
+	uint32_t dirs;
+	int ret;
 
 	data = dev->data;
 	cfg = dev->config;
@@ -861,9 +900,7 @@ static int sai_trigger_post_stop(const struct device *dev, enum dai_dir dir)
 		return -EINVAL;
 	}
 
-	/* a completed STOP leaves the direction in STOPPING, or READY if
-	 * the disable timed out
-	 */
+	/* a STOP leaves the direction in STOPPING, and config_set() in READY */
 	state = sai_get_state(dir, data);
 	if (state != DAI_STATE_STOPPING && state != DAI_STATE_READY) {
 		LOG_ERR("POST_STOP on dir %d needs it stopped, state is %d", dir, state);
@@ -872,27 +909,40 @@ static int sai_trigger_post_stop(const struct device *dev, enum dai_dir dir)
 
 	/*
 	 * A suspended SAI has its clocks gated, so its bit clock is already
-	 * stopped. Resuming it just to clear BCE would restart BCLK until the
-	 * clear took effect at the end of the frame.
+	 * stopped, and its registers cannot be written. Resuming it just to
+	 * clear BCE would restart BCLK until the clear took effect at the end
+	 * of the frame. Record the bits instead: sai_pm_action() writes them
+	 * as soon as anything resumes the SAI, so BCLK runs for at most a
+	 * frame.
 	 */
+	dirs = sai_tx_rx_dirs(data, cfg, dir);
+	for (enum dai_dir d = DAI_DIR_TX; d <= DAI_DIR_RX; d++) {
+		state = sai_get_state(d, data);
+		if (d != dir && (state == DAI_STATE_RUNNING || state == DAI_STATE_PAUSED ||
+				 state == DAI_STATE_ERROR)) {
+			dirs &= ~BIT(d);
+		}
+	}
+
 	ret = pm_device_state_get(dev, &pm_state);
 	if (ret == 0 && pm_state == PM_DEVICE_STATE_SUSPENDED) {
+		sai_tx_rx_request_disable(data, dirs, SAI_CSR_BCE_MASK, false);
 		return 0;
 	}
 
-	ret = pm_device_runtime_get(dev);
+	ret = sai_pm_get(dev);
 	if (ret < 0) {
-		LOG_ERR("failed to get() SAI device: %d", ret);
 		return ret;
 	}
 
 	LOG_DBG("post-stop on direction %d", dir);
 
-	ret = sai_tx_rx_disable(data, cfg, dir, true);
+	/* this may follow STOP within its frame, with TE/RE not yet clear;
+	 * BCE then clears at the end of that same frame
+	 */
+	sai_tx_rx_request_disable(data, dirs, SAI_CSR_BCE_MASK, true);
 
-	pm_ret = pm_device_runtime_put(dev);
-
-	return ret < 0 ? ret : pm_ret;
+	return pm_device_runtime_put(dev);
 }
 
 static int sai_trigger_start(const struct device *dev,
@@ -900,7 +950,8 @@ static int sai_trigger_start(const struct device *dev,
 {
 	struct sai_data *data;
 	const struct sai_config *cfg;
-	uint32_t old_state;
+	uint32_t old_state, dirs;
+	bool reset;
 	int ret, i;
 
 	data = dev->data;
@@ -913,11 +964,33 @@ static int sai_trigger_start(const struct device *dev,
 		return -EINVAL;
 	}
 
+	/* a START from STOPPING or READY software resets the direction, which
+	 * needs it fully disabled, so wait out a STOP issued in the current
+	 * frame; see sai_tx_rx_wait_disabled() for why a timeout carries on.
+	 *
+	 * A resume from PAUSED does no reset and so does not wait.
+	 */
+	dirs = sai_tx_rx_dirs(data, cfg, dir);
+	reset = old_state == DAI_STATE_STOPPING || old_state == DAI_STATE_READY;
+	if (reset) {
+		ret = sai_pm_get(dev);
+		if (ret < 0) {
+			return ret;
+		}
+
+		if (sai_tx_rx_wait_disabled(data, dirs) < 0) {
+			LOG_WRN("starting dir %d anyway", dir);
+		}
+	}
+
 	/* attempt to change state */
 	ret = sai_update_state(dir, data, DAI_STATE_RUNNING);
 	if (ret < 0) {
 		LOG_ERR("failed to transition to RUNNING from %d. Reason: %d",
 			sai_get_state(dir, data), ret);
+		if (reset) {
+			pm_device_runtime_put(dev);
+		}
 		return ret;
 	}
 
@@ -932,13 +1005,7 @@ static int sai_trigger_start(const struct device *dev,
 
 	LOG_DBG("start on direction %d", dir);
 
-	ret = pm_device_runtime_get(dev);
-	if (ret < 0) {
-		LOG_ERR("failed to get() SAI device: %d", ret);
-		return ret;
-	}
-
-	sai_tx_rx_sw_reset(data, cfg, dir);
+	sai_tx_rx_sw_reset(data, dirs);
 
 	irq_enable(cfg->irq);
 
@@ -946,11 +1013,10 @@ static int sai_trigger_start(const struct device *dev,
 	 * sai_fifo_error()); clear it so it neither holds the FIFO nor raises
 	 * an interrupt the moment the error interrupt is enabled
 	 */
-	SAI_TX_RX_STATUS_CLEAR(dir, data->regmap, kSAI_FIFOErrorFlag);
+	sai_tx_rx_status_clear(data, dir, kSAI_FIFOErrorFlag);
 
 	/* enable error interrupt */
-	SAI_TX_RX_ENABLE_DISABLE_IRQ(dir, data->regmap,
-				     kSAI_FIFOErrorInterruptEnable, true);
+	sai_tx_rx_irq_enable(data, dir, kSAI_FIFOErrorInterruptEnable, true);
 
 	/* avoid initial underrun by writing a frame's worth of 0s */
 	if (dir == DAI_DIR_TX) {
@@ -960,7 +1026,7 @@ static int sai_trigger_start(const struct device *dev,
 	}
 
 	/* TODO: for now, only DMA mode is supported */
-	SAI_TX_RX_DMA_ENABLE_DISABLE(dir, data->regmap, true);
+	sai_tx_rx_dma_enable(data, dir, true);
 
 out_enable_dline:
 	/* enable TX/RX data line. This translates to TX_DLINE0/RX_DLINE0
@@ -971,7 +1037,15 @@ out_enable_dline:
 	sai_tx_rx_set_dline_mask(dir, data->regmap,
 				 SAI_TX_RX_DLINE_MASK(dir, cfg));
 
-	/* this will also enable the async side */
+	/* this will also enable the async side, and sets BCE with TE/RE, so
+	 * no disable is pending on any direction it enables any more
+	 */
+	dirs |= BIT(dir);
+	for (enum dai_dir d = DAI_DIR_TX; d <= DAI_DIR_RX; d++) {
+		if ((dirs & BIT(d)) != 0U) {
+			*sai_csr_off(data, d) = 0U;
+		}
+	}
 	SAI_TX_RX_ENABLE_DISABLE(dir, data->regmap, true);
 
 	/* update the software state of TX/RX */
@@ -1068,7 +1142,7 @@ int dai_nxp_sai_recover(const struct device *dev, enum dai_dir dir)
 	 * transmitter/receiver, and so the bit clock and frame sync it may
 	 * be generating, never stop.
 	 */
-	sai_tx_rx_fifo_reset(dir, data->regmap);
+	sai_tx_rx_fifo_reset(data, dir);
 
 	/* as in sai_trigger_start(): a frame of zeros so TX does not
 	 * underrun again at the very next frame
@@ -1079,9 +1153,9 @@ int dai_nxp_sai_recover(const struct device *dev, enum dai_dir dir)
 		}
 	}
 
-	SAI_TX_RX_DMA_ENABLE_DISABLE(dir, data->regmap, true);
-	SAI_TX_RX_STATUS_CLEAR(dir, data->regmap, kSAI_FIFOErrorFlag);
-	SAI_TX_RX_ENABLE_DISABLE_IRQ(dir, data->regmap, kSAI_FIFOErrorInterruptEnable, true);
+	sai_tx_rx_dma_enable(data, dir, true);
+	sai_tx_rx_status_clear(data, dir, kSAI_FIFOErrorFlag);
+	sai_tx_rx_irq_enable(data, dir, kSAI_FIFOErrorInterruptEnable, true);
 
 	/* not through sai_update_state(): ERROR -> RUNNING is legal only
 	 * here, and allowing it there would let a START skip its stop
@@ -1157,6 +1231,8 @@ __maybe_unused static int sai_pm_action(const struct device *dev,
 {
 	bool enable = true;
 
+	int ret;
+
 	switch (action) {
 	case PM_DEVICE_ACTION_RESUME:
 		break;
@@ -1170,7 +1246,18 @@ __maybe_unused static int sai_pm_action(const struct device *dev,
 		return -ENOTSUP;
 	}
 
-	return sai_clks_enable_disable(dev, enable);
+	ret = sai_clks_enable_disable(dev, enable);
+
+	/* a POST_STOP issued while suspended could only record which bit
+	 * clocks to stop (see sai_trigger_post_stop()); write them now,
+	 * whatever resumed the SAI, before BCLK runs for more than a frame
+	 */
+	if (ret == 0 && enable) {
+		sai_tx_rx_csr_reapply(dev->data, DAI_DIR_TX);
+		sai_tx_rx_csr_reapply(dev->data, DAI_DIR_RX);
+	}
+
+	return ret;
 }
 
 static int sai_init(const struct device *dev)

@@ -186,11 +186,6 @@
  */
 #define SAI_INVERT_POLARITY(polarity) (polarity) = !(polarity)
 
-/* used to issue a software reset of the transmitter/receiver */
-#define SAI_TX_RX_SW_RESET(dir, regmap)\
-	((dir) == DAI_DIR_RX ? SAI_RxSoftwareReset(UINT_TO_I2S(regmap), kSAI_ResetTypeSoftware) :\
-	 SAI_TxSoftwareReset(UINT_TO_I2S(regmap), kSAI_ResetTypeSoftware))
-
 /* used to enable/disable the transmitter/receiver.
  * When enabling the SYNC component, the ASYNC component will also be enabled.
  * Attempting to disable the SYNC component will fail unless the SYNC bit is
@@ -201,46 +196,30 @@
 	((dir) == DAI_DIR_RX ? SAI_RxEnable(UINT_TO_I2S(regmap), enable) :\
 	 SAI_TxEnable(UINT_TO_I2S(regmap), enable))
 
-/* used to enable/disable the DMA requests for transmitter/receiver */
-#define SAI_TX_RX_DMA_ENABLE_DISABLE(dir, regmap, enable)\
-	((dir) == DAI_DIR_RX ? SAI_RxEnableDMA(UINT_TO_I2S(regmap),\
-					       kSAI_FIFORequestDMAEnable, enable) :\
-	SAI_TxEnableDMA(UINT_TO_I2S(regmap), kSAI_FIFORequestDMAEnable, enable))
+/* TCSR and RCSR bits, which sit at the same positions in both; the HAL's
+ * kSAI_* masks rely on that too
+ */
+#define SAI_CSR_XE_MASK  I2S_TCSR_TE_MASK
+#define SAI_CSR_BCE_MASK I2S_TCSR_BCE_MASK
+#define SAI_CSR_SR_MASK  I2S_TCSR_SR_MASK
+#define SAI_CSR_FR_MASK  I2S_TCSR_FR_MASK
+/* the write-1-to-clear flags: word start, sync error and FIFO error */
+#define SAI_CSR_W1C_MASK (I2S_TCSR_WSF_MASK | I2S_TCSR_SEF_MASK | I2S_TCSR_FEF_MASK)
+BUILD_ASSERT(I2S_TCSR_TE_MASK == I2S_RCSR_RE_MASK && I2S_TCSR_BCE_MASK == I2S_RCSR_BCE_MASK &&
+		     I2S_TCSR_SR_MASK == I2S_RCSR_SR_MASK && I2S_TCSR_FR_MASK == I2S_RCSR_FR_MASK &&
+		     SAI_CSR_W1C_MASK ==
+			     (I2S_RCSR_WSF_MASK | I2S_RCSR_SEF_MASK | I2S_RCSR_FEF_MASK),
+	     "TCSR and RCSR bits differ");
 
 /* used to check if the hardware transmitter/receiver is enabled */
 #define SAI_TX_RX_IS_HW_ENABLED(dir, regmap)\
 	((dir) == DAI_DIR_RX ? (UINT_TO_I2S(regmap)->RCSR & I2S_RCSR_RE_MASK) : \
 	 (UINT_TO_I2S(regmap)->TCSR & I2S_TCSR_TE_MASK))
 
-/* used to check if the transmitter/receiver's bit clock is enabled */
-#define SAI_TX_RX_IS_BCLK_ENABLED(dir, regmap)                                                     \
-	((dir) == DAI_DIR_RX ? (UINT_TO_I2S(regmap)->RCSR & I2S_RCSR_BCE_MASK)                     \
-			     : (UINT_TO_I2S(regmap)->TCSR & I2S_TCSR_BCE_MASK))
-
-/* used to enable various transmitter/receiver interrupts */
-#define _SAI_TX_RX_ENABLE_IRQ(dir, regmap, which)\
-	((dir) == DAI_DIR_RX ? SAI_RxEnableInterrupts(UINT_TO_I2S(regmap), which) : \
-	 SAI_TxEnableInterrupts(UINT_TO_I2S(regmap), which))
-
-/* used to disable various transmitter/receiver interrupts */
-#define _SAI_TX_RX_DISABLE_IRQ(dir, regmap, which)\
-	((dir) == DAI_DIR_RX ? SAI_RxDisableInterrupts(UINT_TO_I2S(regmap), which) : \
-	 SAI_TxDisableInterrupts(UINT_TO_I2S(regmap), which))
-
-/* used to enable/disable various transmitter/receiver interrupts */
-#define SAI_TX_RX_ENABLE_DISABLE_IRQ(dir, regmap, which, enable)\
-	((enable == true) ? _SAI_TX_RX_ENABLE_IRQ(dir, regmap, which) :\
-	 _SAI_TX_RX_DISABLE_IRQ(dir, regmap, which))
-
 /* used to check if a status flag is set */
 #define SAI_TX_RX_STATUS_IS_SET(dir, regmap, which)\
 	((dir) == DAI_DIR_RX ? ((UINT_TO_I2S(regmap))->RCSR & (which)) : \
 	 ((UINT_TO_I2S(regmap))->TCSR & (which)))
-
-/* used to clear status flags */
-#define SAI_TX_RX_STATUS_CLEAR(dir, regmap, which)						\
-	((dir) == DAI_DIR_RX ? SAI_RxClearStatusFlags(UINT_TO_I2S(regmap), which)		\
-			     : SAI_TxClearStatusFlags(UINT_TO_I2S(regmap), which))
 
 /* used to retrieve the SYNC direction. Use this macro when you know for sure
  * you have 1 SYNC direction with 1 ASYNC direction.
@@ -281,6 +260,11 @@ struct sai_data {
 	sai_transceiver_t tx_config;
 	bool tx_enabled;
 	bool rx_enabled;
+	/* xCSR enable bits a disable has asked the hardware to clear, and
+	 * which no START has set again since; see sai_dir_disable()
+	 */
+	uint32_t tx_csr_off;
+	uint32_t rx_csr_off;
 	enum dai_state tx_state;
 	enum dai_state rx_state;
 	struct dai_config cfg;
@@ -554,7 +538,38 @@ static int sai_update_state(enum dai_dir dir,
 	return ret;
 }
 
-/* Disable a direction or, with @bclk, its bit clock.
+static inline uint32_t *sai_csr_off(struct sai_data *data, enum dai_dir dir)
+{
+	return dir == DAI_DIR_TX ? &data->tx_csr_off : &data->rx_csr_off;
+}
+
+/* Read-modify-write a direction's TCSR/RCSR: clear @clear, then set @set.
+ *
+ * Every write to TCSR/RCSR goes through here, except enabling the direction
+ * (START) and resetting its configuration (config_set()), for two reasons.
+ *
+ * The write-1-to-clear flags (WSF, SEF, FEF) are written as 0 unless named
+ * in @set, so a flag that reads back set is not cleared as a side effect.
+ *
+ * TE/RE and BCE only clear at the end of the current frame, and read back
+ * as 1 until then, so writing back what was read would set them again and
+ * cancel a disable still pending. Observed on an i.MX RT1176: disabling the
+ * DMA requests right after clearing RE left the receiver enabled for good.
+ * So the enable bits a disable has asked to clear are kept in *_csr_off and
+ * always written as 0, until START enables the direction again.
+ */
+static inline void sai_tx_rx_csr_update(struct sai_data *data, enum dai_dir dir, uint32_t clear,
+					uint32_t set)
+{
+	I2S_Type *base = UINT_TO_I2S(data->regmap);
+	volatile uint32_t *csr = dir == DAI_DIR_RX ? &base->RCSR : &base->TCSR;
+
+	*csr = (((*csr & ~SAI_CSR_W1C_MASK) & ~clear) | set) & ~*sai_csr_off(data, dir);
+}
+
+/* Ask the hardware to clear enable bits of a direction (SAI_CSR_XE_MASK and
+ * optionally SAI_CSR_BCE_MASK), and keep them clear until START. They only
+ * clear at the end of the current frame.
  *
  * Setting TE/RE also sets BCE, but clearing TE/RE leaves BCE set, so a
  * direction that provides the bit clock carries on driving BCLK after it
@@ -562,19 +577,50 @@ static int sai_update_state(enum dai_dir dir,
  * its full rate 1 ms after RE had read back 0. STOP and PAUSE rely on
  * that: the DAI API keeps the clocks running until POST_STOP, since a
  * codec that derives its clocks from BCLK treats losing them as a fault.
- * POST_STOP clears BCE with @bclk once TE/RE are already clear.
+ * POST_STOP clears BCE as well.
  */
-static inline void sai_tx_rx_force_disable(enum dai_dir dir, uint32_t regmap, bool bclk)
+static inline void sai_tx_rx_force_disable(struct sai_data *data, enum dai_dir dir, uint32_t bits)
 {
-	I2S_Type *base = UINT_TO_I2S(regmap);
+	*sai_csr_off(data, dir) |= bits;
+	sai_tx_rx_csr_update(data, dir, 0U, 0U);
+}
 
-	if (dir == DAI_DIR_RX) {
-		base->RCSR =
-			(base->RCSR & 0xFFE3FFFFU) & ~(bclk ? I2S_RCSR_BCE_MASK : I2S_RCSR_RE_MASK);
-	} else {
-		base->TCSR =
-			(base->TCSR & 0xFFE3FFFFU) & ~(bclk ? I2S_TCSR_BCE_MASK : I2S_TCSR_TE_MASK);
+/* Write again the enable bits a disable asked to clear, after runtime PM
+ * resumed a SAI whose registers could not be written while suspended; see
+ * sai_pm_action().
+ */
+static inline void sai_tx_rx_csr_reapply(struct sai_data *data, enum dai_dir dir)
+{
+	if (*sai_csr_off(data, dir) != 0U) {
+		sai_tx_rx_csr_update(data, dir, 0U, 0U);
 	}
+}
+
+/* used to enable/disable the DMA requests for transmitter/receiver */
+static inline void sai_tx_rx_dma_enable(struct sai_data *data, enum dai_dir dir, bool enable)
+{
+	sai_tx_rx_csr_update(data, dir, enable ? 0U : kSAI_FIFORequestDMAEnable,
+			     enable ? kSAI_FIFORequestDMAEnable : 0U);
+}
+
+/* used to enable/disable various transmitter/receiver interrupts */
+static inline void sai_tx_rx_irq_enable(struct sai_data *data, enum dai_dir dir, uint32_t which,
+					bool enable)
+{
+	sai_tx_rx_csr_update(data, dir, enable ? 0U : which, enable ? which : 0U);
+}
+
+/* used to clear status flags */
+static inline void sai_tx_rx_status_clear(struct sai_data *data, enum dai_dir dir, uint32_t which)
+{
+	sai_tx_rx_csr_update(data, dir, 0U, which);
+}
+
+/* used to issue a software reset of the transmitter/receiver */
+static inline void sai_tx_rx_dir_sw_reset(struct sai_data *data, enum dai_dir dir)
+{
+	sai_tx_rx_csr_update(data, dir, 0U, SAI_CSR_SR_MASK);
+	sai_tx_rx_csr_update(data, dir, SAI_CSR_SR_MASK, 0U);
 }
 
 /* Empty a direction's FIFO without touching its write-1-to-clear status
@@ -582,15 +628,9 @@ static inline void sai_tx_rx_force_disable(enum dai_dir dir, uint32_t regmap, bo
  * writes a set FEF back as 1 and so clears it in the same write; recovering
  * from a FIFO error needs the FIFO emptied while FEF is still set.
  */
-static inline void sai_tx_rx_fifo_reset(enum dai_dir dir, uint32_t regmap)
+static inline void sai_tx_rx_fifo_reset(struct sai_data *data, enum dai_dir dir)
 {
-	I2S_Type *base = UINT_TO_I2S(regmap);
-
-	if (dir == DAI_DIR_RX) {
-		base->RCSR = (base->RCSR & 0xFFE3FFFFU) | I2S_RCSR_FR_MASK;
-	} else {
-		base->TCSR = (base->TCSR & 0xFFE3FFFFU) | I2S_TCSR_FR_MASK;
-	}
+	sai_tx_rx_csr_update(data, dir, 0U, SAI_CSR_FR_MASK);
 }
 
 static inline void sai_tx_rx_sw_enable_disable(enum dai_dir dir,
