@@ -148,11 +148,24 @@ static int sai_mclk_config(const struct device *dev,
  *
  * Only a RUNNING direction is halted. One already stopping, or paused, is
  * on its way down anyway and just has its flag cleared, as before.
+ *
+ * A direction already halted is left as it is: clearing its held flag
+ * would let it run on with its DMA requests off. Its error interrupt and
+ * DMA requests are cleared again, in case a register write that raced the
+ * halt set them back, and nothing is counted or reported. Returns false in
+ * that case, and otherwise sets *@halted to whether the direction was
+ * halted.
  */
-static bool sai_fifo_error(const struct device *dev, enum dai_dir dir)
+static bool sai_fifo_error(const struct device *dev, enum dai_dir dir, bool *halted)
 {
 	struct sai_data *data = dev->data;
-	bool halted = false;
+
+	if (sai_get_state(dir, data) == DAI_STATE_ERROR) {
+		sai_tx_rx_halt(data, dir);
+		return false;
+	}
+
+	*halted = false;
 
 	if (dir == DAI_DIR_RX) {
 		data->rx_fifo_errors++;
@@ -162,20 +175,41 @@ static bool sai_fifo_error(const struct device *dev, enum dai_dir dir)
 
 	if (IS_ENABLED(CONFIG_DAI_NXP_SAI_STOP_ON_FIFO_ERROR) &&
 	    sai_update_state(dir, data, DAI_STATE_ERROR) == 0) {
-		sai_tx_rx_dma_enable(data, dir, false);
-		sai_tx_rx_irq_enable(data, dir, kSAI_FIFOErrorInterruptEnable, false);
-		halted = true;
+		sai_tx_rx_halt(data, dir);
+		*halted = true;
 	} else {
 		sai_tx_rx_status_clear(data, dir, kSAI_FIFOErrorFlag);
 	}
 
 	if (data->error_cb != NULL) {
-		data->error_cb(dev, dir, halted, data->error_cb_data);
+		data->error_cb(dev, dir, *halted, data->error_cb_data);
 	}
 
-	return halted;
+	return true;
 }
 
+/*
+ * TX and RX share one interrupt, and this checks both directions whichever
+ * raised it, so a set FIFO error flag alone is not enough: a direction is
+ * only handled if its error interrupt is enabled.
+ *
+ * A direction halted by sai_fifo_error() holds its flag set on purpose,
+ * with the interrupt masked. Handling it again when the other direction
+ * raised the interrupt cleared the held flag, which let the halted
+ * direction run on from the next frame with its DMA requests off, counted
+ * the error twice, and reported the direction to the error callback as not
+ * halted.
+ *
+ * A stopped direction has the interrupt masked too. STOP turns its DMA
+ * requests off before the transmitter/receiver goes down at the end of the
+ * frame, so it may overrun or underrun in that last frame; that data is
+ * discarded anyway, and START clears the flag, so it is not reported as an
+ * error.
+ *
+ * In synchronous mode, enabling the SYNC direction also enables the ASYNC
+ * one in hardware, without a START, so with its interrupt masked. Its FIFO
+ * errors, which nobody consumes, are not reported either.
+ */
 void sai_isr(const void *parameter)
 {
 	const struct device *dev;
@@ -186,15 +220,15 @@ void sai_isr(const void *parameter)
 	data = dev->data;
 
 	/* check for TX FIFO error */
-	if (SAI_TX_RX_STATUS_IS_SET(DAI_DIR_TX, data->regmap, kSAI_FIFOErrorFlag)) {
-		halted = sai_fifo_error(dev, DAI_DIR_TX);
+	if (sai_tx_rx_fifo_error_pending(data, DAI_DIR_TX) &&
+	    sai_fifo_error(dev, DAI_DIR_TX, &halted)) {
 		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO underrun detected%s",
 				       halted ? ", TX halted until restarted" : "");
 	}
 
 	/* check for RX FIFO error */
-	if (SAI_TX_RX_STATUS_IS_SET(DAI_DIR_RX, data->regmap, kSAI_FIFOErrorFlag)) {
-		halted = sai_fifo_error(dev, DAI_DIR_RX);
+	if (sai_tx_rx_fifo_error_pending(data, DAI_DIR_RX) &&
+	    sai_fifo_error(dev, DAI_DIR_RX, &halted)) {
 		LOG_WRN_RATELIMIT_RATE(SAI_FIFO_ERROR_REPORT_MS, "FIFO overrun detected%s",
 				       halted ? ", RX halted until restarted" : "");
 	}
@@ -951,6 +985,7 @@ static int sai_trigger_start(const struct device *dev,
 	struct sai_data *data;
 	const struct sai_config *cfg;
 	uint32_t old_state, dirs;
+	unsigned int key;
 	bool reset;
 	int ret, i;
 
@@ -1046,7 +1081,13 @@ out_enable_dline:
 			*sai_csr_off(data, d) = 0U;
 		}
 	}
+	/* the HAL enable is a read-modify-write of both directions' registers
+	 * in synchronous mode; lock it against the FIFO error ISR, as in
+	 * sai_tx_rx_csr_update()
+	 */
+	key = irq_lock();
 	SAI_TX_RX_ENABLE_DISABLE(dir, data->regmap, true);
+	irq_unlock(key);
 
 	/* update the software state of TX/RX */
 	sai_tx_rx_sw_enable_disable(dir, data, true);

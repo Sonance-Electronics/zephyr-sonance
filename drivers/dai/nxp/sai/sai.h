@@ -216,11 +216,6 @@ BUILD_ASSERT(I2S_TCSR_TE_MASK == I2S_RCSR_RE_MASK && I2S_TCSR_BCE_MASK == I2S_RC
 	((dir) == DAI_DIR_RX ? (UINT_TO_I2S(regmap)->RCSR & I2S_RCSR_RE_MASK) : \
 	 (UINT_TO_I2S(regmap)->TCSR & I2S_TCSR_TE_MASK))
 
-/* used to check if a status flag is set */
-#define SAI_TX_RX_STATUS_IS_SET(dir, regmap, which)\
-	((dir) == DAI_DIR_RX ? ((UINT_TO_I2S(regmap))->RCSR & (which)) : \
-	 ((UINT_TO_I2S(regmap))->TCSR & (which)))
-
 /* used to retrieve the SYNC direction. Use this macro when you know for sure
  * you have 1 SYNC direction with 1 ASYNC direction.
  */
@@ -557,14 +552,24 @@ static inline uint32_t *sai_csr_off(struct sai_data *data, enum dai_dir dir)
  * DMA requests right after clearing RE left the receiver enabled for good.
  * So the enable bits a disable has asked to clear are kept in *_csr_off and
  * always written as 0, until START enables the direction again.
+ *
+ * The update runs with interrupts locked, as the FIFO error ISR updates the
+ * same registers.
  */
 static inline void sai_tx_rx_csr_update(struct sai_data *data, enum dai_dir dir, uint32_t clear,
 					uint32_t set)
 {
 	I2S_Type *base = UINT_TO_I2S(data->regmap);
 	volatile uint32_t *csr = dir == DAI_DIR_RX ? &base->RCSR : &base->TCSR;
+	unsigned int key;
 
+	/* the FIFO error ISR also updates these registers, to halt a
+	 * direction; a read-modify-write it interrupted would write back
+	 * the interrupt and DMA enables it had just cleared
+	 */
+	key = irq_lock();
 	*csr = (((*csr & ~SAI_CSR_W1C_MASK) & ~clear) | set) & ~*sai_csr_off(data, dir);
+	irq_unlock(key);
 }
 
 /* Ask the hardware to clear enable bits of a direction (SAI_CSR_XE_MASK and
@@ -610,10 +615,27 @@ static inline void sai_tx_rx_irq_enable(struct sai_data *data, enum dai_dir dir,
 	sai_tx_rx_csr_update(data, dir, enable ? 0U : which, enable ? which : 0U);
 }
 
+/* halt a direction on a FIFO error: DMA requests and error interrupt off */
+static inline void sai_tx_rx_halt(struct sai_data *data, enum dai_dir dir)
+{
+	sai_tx_rx_csr_update(data, dir, kSAI_FIFORequestDMAEnable | kSAI_FIFOErrorInterruptEnable,
+			     0U);
+}
+
 /* used to clear status flags */
 static inline void sai_tx_rx_status_clear(struct sai_data *data, enum dai_dir dir, uint32_t which)
 {
 	sai_tx_rx_csr_update(data, dir, 0U, which);
+}
+
+/* true if a direction's FIFO error flag is set and its error interrupt enabled */
+static inline bool sai_tx_rx_fifo_error_pending(struct sai_data *data, enum dai_dir dir)
+{
+	const uint32_t mask = kSAI_FIFOErrorFlag | kSAI_FIFOErrorInterruptEnable;
+	I2S_Type *base = UINT_TO_I2S(data->regmap);
+	uint32_t csr = dir == DAI_DIR_RX ? base->RCSR : base->TCSR;
+
+	return (csr & mask) == mask;
 }
 
 /* used to issue a software reset of the transmitter/receiver */

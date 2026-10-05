@@ -45,12 +45,21 @@ extern "C" {
 struct dai_nxp_sai_status {
 	/** Current state; DAI_STATE_ERROR after a FIFO error halted it. */
 	enum dai_state state;
-	/** FIFO errors since boot, whether or not they halted the direction. */
+	/**
+	 * FIFO errors since boot reported as for dai_nxp_sai_error_cb_t,
+	 * whether or not they halted the direction.
+	 */
 	uint32_t fifo_errors;
 };
 
 /**
- * @brief Called from the SAI's ISR on every FIFO error.
+ * @brief Called from the SAI's ISR on a FIFO error.
+ *
+ * Reported for a direction that is running or paused. Not reported: an
+ * error in the last frame of a stopped direction, whose data STOP discards
+ * anyway; an error in a direction the hardware enabled without a START, as
+ * the ASYNC direction is in synchronous mode; and a repeat on a direction
+ * already halted, until it is recovered or restarted.
  *
  * @param dev SAI device
  * @param dir direction that saw the error
