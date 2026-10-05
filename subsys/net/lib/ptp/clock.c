@@ -31,6 +31,11 @@ LOG_MODULE_REGISTER(ptp_clock, CONFIG_PTP_LOG_LEVEL);
 #define MIN_NSEC_TO_TIMEINTERVAL (0xFFFF800000000000ULL)
 #define MAX_NSEC_TO_TIMEINTERVAL (0x00007FFFFFFFFFFFULL)
 
+/* A mean path delay at or beyond this is not a measurement but timestamps
+ * taken either side of a clock step, see ptp_clock_delay().
+ */
+#define MAX_PLAUSIBLE_DELAY_NS ((int64_t)NSEC_PER_SEC / 2)
+
 /**
  * @brief PTP Clock structure.
  */
@@ -579,6 +584,15 @@ void ptp_clock_synchronize(uint64_t ingress, uint64_t egress)
 
 		ptp_clock_set(ptp_clk.phc, &current);
 		LOG_WRN("Set clock time: %"PRIu64".%09u", current.second, current.nanosecond);
+
+		/* t2 is in the time base just replaced. Pairing it with a t3
+		 * taken after the step would make ptp_clock_delay() report
+		 * half the step as path delay, which forces another step and
+		 * repeats indefinitely. Wait for a Sync in the new time base.
+		 * mean_delay does not depend on the time base and is kept.
+		 */
+		ptp_clk.timestamp.t1 = 0;
+		ptp_clk.timestamp.t2 = 0;
 		return;
 	}
 
@@ -603,6 +617,16 @@ void ptp_clock_delay(uint64_t egress, uint64_t ingress)
 	delay = ((int64_t)(ptp_clk.timestamp.t2 - ptp_clk.timestamp.t3) +
 		 (int64_t)(ptp_clk.timestamp.t4 - ptp_clk.timestamp.t1)) /
 		2LL;
+
+	/* A Delay_Req sent before a clock step and answered after it carries
+	 * a t3 in the old time base, so the result is off by half the step.
+	 * Steps are over 1 s, so that is over MAX_PLAUSIBLE_DELAY_NS. Discard
+	 * it rather than let it trigger another step.
+	 */
+	if (delay >= MAX_PLAUSIBLE_DELAY_NS || delay <= -MAX_PLAUSIBLE_DELAY_NS) {
+		LOG_WRN("Discarding implausible path delay %lldns", delay);
+		return;
+	}
 
 	LOG_DBG("Delay %lldns", delay);
 	ptp_clk.current_ds.mean_delay = clock_ns_to_timeinterval(delay);
