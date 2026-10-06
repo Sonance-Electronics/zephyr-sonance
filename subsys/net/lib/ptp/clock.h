@@ -237,6 +237,17 @@ void ptp_clock_pollfd_invalidate(void);
 void ptp_clock_signal_timeout(void);
 
 /**
+ * @brief Debug-only view of the PTP thread's wakeup path.
+ *
+ * @param count Filled with the number of entries in the returned array.
+ * @param valid Filled with whether the socket entries have been populated.
+ * @param work_busy Filled with k_work_busy_get() of the timeout work item.
+ *
+ * @return The poll array: entry 0 is the timeout eventfd, the rest are sockets.
+ */
+const struct zsock_pollfd *ptp_clock_diag_pollfds(size_t *count, bool *valid, int *work_busy);
+
+/**
  * @brief Function signalling to the PTP Clock that STATE_DECISION_EVENT occurred and
  * it needs to be handled.
  */

@@ -960,6 +960,15 @@ void ptp_clock_pollfd_invalidate(void)
 	}
 }
 
+const struct zsock_pollfd *ptp_clock_diag_pollfds(size_t *count, bool *valid, int *work_busy)
+{
+	*count = 1 + PTP_SOCKET_CNT * ptp_clk.default_ds.n_ports;
+	*valid = ptp_clk.pollfd_valid;
+	*work_busy = k_work_busy_get(&ptp_clk.timeout_work);
+
+	return ptp_clk.pollfd;
+}
+
 void ptp_clock_signal_timeout(void)
 {
 	k_work_submit(&ptp_clk.timeout_work);
