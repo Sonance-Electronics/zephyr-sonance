@@ -1877,6 +1877,11 @@ enum ptp_port_event ptp_port_event_gen(struct ptp_port *port, int idx)
 		return PTP_EVT_NONE;
 	}
 
+	if (ptp_fault_rx(port, msg)) {
+		ptp_msg_unref(msg);
+		return PTP_EVT_NONE;
+	}
+
 	switch (ptp_msg_type(msg)) {
 	case PTP_MSG_SYNC:
 		port_sync_msg_process(port, msg);
@@ -2231,6 +2236,14 @@ void ptp_port_free_foreign_tts(struct ptp_port *port)
 
 		k_mem_slab_free(&foreign_tts_slab, (void *)foreign);
 	}
+}
+
+__weak bool ptp_fault_rx(struct ptp_port *port, struct ptp_msg *msg)
+{
+	ARG_UNUSED(port);
+	ARG_UNUSED(msg);
+
+	return false;
 }
 
 int ptp_port_update_current_time_transmitter(struct ptp_port *port, struct ptp_msg *msg)

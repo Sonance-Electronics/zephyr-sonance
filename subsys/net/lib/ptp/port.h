@@ -170,6 +170,20 @@ enum ptp_port_event ptp_port_timer_event_gen(struct ptp_port *port, struct k_tim
 enum ptp_port_event ptp_port_event_gen(struct ptp_port *port, int idx);
 
 /**
+ * @brief Debug-only fault-injection hook for received PTP messages.
+ *
+ * Called for every received message after it is parsed (timestamps in host
+ * format) and before it is processed. The default does nothing; an
+ * application may override it to adjust @p msg's timestamps or to drop it.
+ *
+ * @param[in] port PTP Port the message arrived on.
+ * @param[in,out] msg Received message.
+ *
+ * @return true to drop the message, false to process it.
+ */
+bool ptp_fault_rx(struct ptp_port *port, struct ptp_msg *msg);
+
+/**
  * @brief Function handling PTP Port event.
  *
  * @param[in] port    Pointer to the PTP Port structure.
