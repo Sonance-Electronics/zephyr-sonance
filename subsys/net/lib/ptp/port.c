@@ -1120,17 +1120,28 @@ enum ptp_port_event ptp_port_event_gen(struct ptp_port *port, int idx)
 		return PTP_EVT_NONE;
 	}
 
+	/*
+	 * A fault resets the port and loses the time transmitter, so keep it
+	 * for a socket that has actually failed. An empty or malformed
+	 * datagram, which any host can send, and a wakeup with nothing to
+	 * read are dropped instead.
+	 */
 	cnt = ptp_transport_recv(port, msg, idx);
-	if (cnt <= 0) {
-		LOG_ERR("Error during message reception");
+	if (cnt == 0 || cnt == -EAGAIN || cnt == -EWOULDBLOCK) {
+		ptp_msg_unref(msg);
+		return PTP_EVT_NONE;
+	}
+	if (cnt < 0) {
+		LOG_ERR("Error during message reception (%d)", cnt);
 		ptp_msg_unref(msg);
 		return PTP_EVT_FAULT_DETECTED;
 	}
 
 	ret = ptp_msg_post_recv(port, msg, cnt);
 	if (ret) {
+		LOG_DBG("Dropping a malformed message");
 		ptp_msg_unref(msg);
-		return PTP_EVT_FAULT_DETECTED;
+		return PTP_EVT_NONE;
 	}
 
 	if (ptp_port_id_eq(&msg->header.src_port_id, &port->port_ds.id)) {

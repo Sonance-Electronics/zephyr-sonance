@@ -316,7 +316,13 @@ int ptp_transport_recv(struct ptp_port *port, struct ptp_msg *msg, enum ptp_sock
 
 	cnt = zsock_recvmsg(port->socket[idx], &msghdr, ZSOCK_MSG_DONTWAIT);
 	if (cnt < 0) {
-		LOG_ERR("Failed receive PTP message");
+		/* Before walking the control data, which a failed receive
+		 * leaves zeroed: a zero cmsg_len makes NET_CMSG_NXTHDR()
+		 * return the same header for ever.
+		 */
+		cnt = -errno;
+		LOG_DBG("Failed receive PTP message (%d)", cnt);
+		return cnt;
 	}
 
 	for (cmsg = NET_CMSG_FIRSTHDR(&msghdr); cmsg != NULL;
