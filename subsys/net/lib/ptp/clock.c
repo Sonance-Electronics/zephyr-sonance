@@ -381,7 +381,9 @@ static bool clock_best_id_update(const struct ptp_foreign_tt_clock *best)
  * delay is not the new path's, and a lock on it would hold back the new
  * parent's offset as an outlier for CONFIG_PTP_OFFSET_OUTLIER_COUNT Syncs
  * if the two disagree. ptp_clock_synchronize() waits for a new path delay
- * before acting, as it does at startup.
+ * before acting, as it does at startup. The servo's frequency estimate is
+ * relative to the previous parent, which need not run at the same rate
+ * as the next.
  */
 static void clock_sync_reset(void)
 {
@@ -390,6 +392,7 @@ static void clock_sync_reset(void)
 	ptp_clk.current_ds.offset_from_tt = 0;
 	ptp_clk.locked_syncs = 0;
 	ptp_clk.outliers = 0;
+	ptp_clk.pi_drift = 0.0;
 }
 
 void ptp_clock_handle_state_decision_evt(void)
@@ -603,6 +606,8 @@ static double ptp_servo_pi(int64_t nanosecond_diff)
 	double ppb;
 
 	ptp_clk.pi_drift += ki * nanosecond_diff;
+	ptp_clk.pi_drift = CLAMP(ptp_clk.pi_drift, -(double)CONFIG_PTP_SERVO_MAX_DRIFT_PPB,
+				 (double)CONFIG_PTP_SERVO_MAX_DRIFT_PPB);
 	ppb = kp * nanosecond_diff + ptp_clk.pi_drift;
 
 	return ppb;
