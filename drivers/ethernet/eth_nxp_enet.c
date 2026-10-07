@@ -175,8 +175,10 @@ static bool eth_get_ptp_data(struct net_if *iface, struct net_pkt *pkt)
 static inline void ts_register_tx_event(const struct device *dev,
 					 enet_frame_info_t *frameinfo)
 {
+	const struct nxp_enet_mac_config *config = dev->config;
 	struct nxp_enet_mac_data *data = dev->data;
 	struct net_pkt *pkt = frameinfo->context;
+	struct net_ptp_time now;
 
 	if (pkt == NULL) {
 		return;
@@ -189,8 +191,23 @@ static inline void ts_register_tx_event(const struct device *dev,
 		 * after waiting for the semaphore in eth_wait_for_ptp_ts().
 		 */
 
+		/* The descriptor holds only nanoseconds, and the SDK adds the
+		 * seconds counter as it is at reclaim, not at transmit. A
+		 * frame sent just before a second boundary and reclaimed
+		 * after the timer wrap was handled is stamped a second late,
+		 * and one reclaimed after the wrap but before it was handled
+		 * a second early. Take the seconds from the current time
+		 * instead, which accounts for a pending wrap, as the receive
+		 * path does: a frame timestamp ahead of the current
+		 * nanoseconds was taken in the previous second.
+		 */
+		ptp_clock_get(config->ptp_clock, &now);
+		if (now.nanosecond < frameinfo->timeStamp.nanosecond) {
+			now.second--;
+		}
+
 		pkt->timestamp.nanosecond = frameinfo->timeStamp.nanosecond;
-		pkt->timestamp.second = frameinfo->timeStamp.second;
+		pkt->timestamp.second = now.second;
 
 		net_if_add_tx_timestamp(pkt);
 	}
