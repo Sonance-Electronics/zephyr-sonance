@@ -474,6 +474,11 @@ struct ptp_tlv *ptp_msg_add_tlv(struct ptp_msg *msg, int length)
 	if (tlv_container) {
 		tlv_container->tlv = (struct ptp_tlv *)suffix;
 		msg->header.msg_length += length;
+		/* On the list, msg_tlv_pre_send() converts it to network
+		 * order and frees it. Off it, it was sent in host order and
+		 * never freed.
+		 */
+		sys_slist_append(&msg->tlvs, &tlv_container->node);
 	}
 
 	return tlv_container ? tlv_container->tlv : NULL;

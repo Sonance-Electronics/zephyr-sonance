@@ -1573,6 +1573,7 @@ int ptp_port_management_resp(struct ptp_port *port, struct ptp_msg *req, struct 
 
 	ret = port_management_resp_tlv_fill(port, req, resp, tlv);
 	if (ret) {
+		ptp_msg_unref(resp);
 		return ret;
 	}
 
