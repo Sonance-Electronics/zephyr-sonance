@@ -62,6 +62,30 @@ config PTP_MSG_POLL_SIZE
 	  PTP messages are allocated dynamically from memory slab. The Kconfig symbol
 	  defines number of blocks in the memory slab.
 
+config PTP_OFFSET_OUTLIER_NS
+	int "Offset that a locked clock treats as a possible outlier (ns)"
+	default 1000000
+	range 0 1000000000
+	help
+	  While the clock is locked, meaning the last 16 offsets it acted on
+	  were within this many nanoseconds, a Sync whose offset is beyond it is
+	  held back until PTP_OFFSET_OUTLIER_COUNT consecutive Syncs are also
+	  beyond it. They need not agree with each other.
+	  This keeps a single bad timestamp, such as a time transmitter's
+	  origin timestamp with a wrong seconds field, from stepping or
+	  slewing the clock. 0 disables the filter.
+
+config PTP_OFFSET_OUTLIER_COUNT
+	int "Consecutive outlying Syncs needed to act on one"
+	default 3
+	range 1 255
+	help
+	  How many Syncs in a row must show an offset beyond
+	  PTP_OFFSET_OUTLIER_NS, while locked, before the clock acts on it.
+	  The earlier ones are discarded. 1 acts on the first, which disables
+	  the filter. A genuine change of time, such as a new time
+	  transmitter, is delayed by this many Sync intervals less one.
+
 choice
 	prompt "PTP Clock Type"
 	default PTP_ORDINARY_CLOCK
