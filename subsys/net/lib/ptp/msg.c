@@ -169,7 +169,7 @@ static int msg_tlv_post_recv(struct ptp_msg *msg, int length)
 
 		if (tlv_container->tlv->length % 2) {
 			/* IEEE 1588-2019 Section 5.3.8 - length is an even number */
-			LOG_ERR("Incorrect length of TLV");
+			LOG_DBG("Incorrect length of TLV");
 			ptp_tlv_free(tlv_container);
 			return -EBADMSG;
 		}
@@ -179,7 +179,7 @@ static int msg_tlv_post_recv(struct ptp_msg *msg, int length)
 		suffix_len += sizeof(struct ptp_tlv);
 
 		if (tlv_container->tlv->length > length) {
-			LOG_ERR("Incorrect length of TLV");
+			LOG_DBG("Incorrect length of TLV");
 			ptp_tlv_free(tlv_container);
 			return -EBADMSG;
 		}
@@ -234,7 +234,7 @@ struct ptp_msg *ptp_msg_alloc(void)
 	int ret = k_mem_slab_alloc(&msg_slab, (void **)&msg, K_NO_WAIT);
 
 	if (ret) {
-		LOG_ERR("Couldn't allocate memory for the message");
+		LOG_DBG("Couldn't allocate memory for the message");
 		return NULL;
 	}
 
@@ -381,13 +381,21 @@ int ptp_msg_post_recv(struct ptp_port *port, struct ptp_msg *msg, int cnt)
 	int64_t current;
 	int tlv_len;
 
-	if (msg_size[type] > cnt) {
-		LOG_ERR("Received message with incorrect length");
+	/* Messages come from any host, so these are not errors of ours, and
+	 * logging each at error level would let one flood the log.
+	 *
+	 * The type is four bits but msg_size[] stops at MANAGEMENT, and the
+	 * reserved types in it have no size, so check both the index and the
+	 * header.
+	 */
+	if (type >= ARRAY_SIZE(msg_size) || cnt < (int)sizeof(struct ptp_header) ||
+	    msg_size[type] > cnt) {
+		LOG_DBG("Received message with incorrect type or length");
 		return -EBADMSG;
 	}
 
 	if (msg_header_post_recv(&msg->header)) {
-		LOG_ERR("Received message incomplient with supported PTP version");
+		LOG_DBG("Received message incomplient with supported PTP version");
 		return -EBADMSG;
 	}
 
@@ -437,12 +445,12 @@ int ptp_msg_post_recv(struct ptp_port *port, struct ptp_msg *msg, int cnt)
 
 	tlv_len = msg_tlv_post_recv(msg, cnt - msg_size[type]);
 	if (tlv_len < 0) {
-		LOG_ERR("Failed processing TLVs");
+		LOG_DBG("Failed processing TLVs");
 		return -EBADMSG;
 	}
 
 	if (msg_size[type] + tlv_len != msg->header.msg_length) {
-		LOG_ERR("Length and TLVs don't correspond with specified in the message");
+		LOG_DBG("Length and TLVs don't correspond with specified in the message");
 		return -EMSGSIZE;
 	}
 
