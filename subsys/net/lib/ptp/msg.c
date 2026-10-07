@@ -140,7 +140,7 @@ static uint8_t *msg_suffix(struct ptp_msg *msg)
 
 static int msg_tlv_post_recv(struct ptp_msg *msg, int length)
 {
-	int suffix_len = 0, ret = 0;
+	int suffix_len = 0, ret = 0, count = 0;
 	struct ptp_tlv_container *tlv_container;
 	uint8_t *suffix = msg_suffix(msg);
 
@@ -150,6 +150,14 @@ static int msg_tlv_post_recv(struct ptp_msg *msg, int length)
 	}
 
 	while (length >= sizeof(struct ptp_tlv)) {
+		/* Bound what one received message can hold of the TLV pool,
+		 * which every message shares.
+		 */
+		if (++count > CONFIG_PTP_MSG_MAX_TLVS) {
+			LOG_DBG("More than %d TLVs in a message", CONFIG_PTP_MSG_MAX_TLVS);
+			return -EBADMSG;
+		}
+
 		tlv_container = ptp_tlv_alloc();
 		if (!tlv_container) {
 			return -ENOMEM;
@@ -219,7 +227,11 @@ static void msg_tlv_pre_send(struct ptp_msg *msg)
 struct ptp_msg *ptp_msg_alloc(void)
 {
 	struct ptp_msg *msg = NULL;
-	int ret = k_mem_slab_alloc(&msg_slab, (void **)&msg, K_FOREVER);
+	/* Never wait: only the PTP thread frees messages, and it is also the
+	 * thread allocating, so waiting for one blocked it for good once the
+	 * pool ran out.
+	 */
+	int ret = k_mem_slab_alloc(&msg_slab, (void **)&msg, K_NO_WAIT);
 
 	if (ret) {
 		LOG_ERR("Couldn't allocate memory for the message");
