@@ -1466,13 +1466,11 @@ void ptp_port_free_foreign_tts(struct ptp_port *port)
 		iter = sys_slist_get(&port->foreign_list);
 		foreign = CONTAINER_OF(iter, struct ptp_foreign_tt_clock, node);
 
-		while (foreign->messages_count > FOREIGN_TIME_TRANSMITTER_THRESHOLD) {
-			struct ptp_msg *msg = (struct ptp_msg *)k_fifo_get(&foreign->messages,
-									   K_NO_WAIT);
-			foreign->messages_count--;
-			ptp_msg_unref(msg);
-		}
-
+		/* All of them: the record is about to be freed, and stopping at
+		 * FOREIGN_TIME_TRANSMITTER_THRESHOLD, as cleanup does, leaked up
+		 * to that many Announce messages each time a port was disabled.
+		 */
+		port_clear_foreign_clock_records(foreign);
 		k_mem_slab_free(&foreign_tts_slab, (void *)foreign);
 	}
 }
