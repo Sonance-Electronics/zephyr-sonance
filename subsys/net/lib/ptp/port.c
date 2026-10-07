@@ -1111,7 +1111,13 @@ enum ptp_port_event ptp_port_event_gen(struct ptp_port *port, int idx)
 
 	msg = ptp_msg_alloc();
 	if (!msg) {
-		return PTP_EVT_FAULT_DETECTED;
+		/* Out of messages for now: lose this one, not the port. It
+		 * must still be read, or the socket stays readable and the
+		 * poll returns straight away.
+		 */
+		LOG_DBG("No message buffer, dropping a received message");
+		ptp_transport_drop(port, idx);
+		return PTP_EVT_NONE;
 	}
 
 	cnt = ptp_transport_recv(port, msg, idx);

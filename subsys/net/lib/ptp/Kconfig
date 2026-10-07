@@ -62,6 +62,16 @@ config PTP_MSG_POLL_SIZE
 	  PTP messages are allocated dynamically from memory slab. The Kconfig symbol
 	  defines number of blocks in the memory slab.
 
+config PTP_MSG_MAX_TLVS
+	int "Most TLVs accepted in one received message"
+	default 4
+	range 1 255
+	help
+	  A received message carrying more TLVs than this is dropped. TLVs
+	  come from a pool shared by all messages, twice
+	  PTP_MSG_POLL_SIZE in size, so this bounds how much of it one
+	  message from the network can take.
+
 config PTP_OFFSET_OUTLIER_NS
 	int "Offset that a locked clock treats as a possible outlier (ns)"
 	default 1000000

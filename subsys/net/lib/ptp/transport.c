@@ -331,6 +331,16 @@ int ptp_transport_recv(struct ptp_port *port, struct ptp_msg *msg, enum ptp_sock
 	return cnt;
 }
 
+void ptp_transport_drop(struct ptp_port *port, enum ptp_socket idx)
+{
+	__ASSERT(PTP_SOCKET_CNT > idx, "Invalid socket index");
+
+	uint8_t byte;
+
+	/* A datagram socket discards whatever of the datagram does not fit */
+	(void)zsock_recv(port->socket[idx], &byte, sizeof(byte), ZSOCK_MSG_DONTWAIT);
+}
+
 int ptp_transport_protocol_addr(struct ptp_port *port, uint8_t *addr)
 {
 	__ASSERT_NO_MSG(addr);
