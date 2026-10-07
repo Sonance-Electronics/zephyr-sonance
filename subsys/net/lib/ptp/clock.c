@@ -60,6 +60,13 @@ struct ptp_clock {
 		uint64_t	    t4;
 	} timestamp;			/* latest timestamps in nanoseconds */
 	double pi_drift;
+	/* The parent and grandmaster at the last state decision, see
+	 * clock_best_id_update().
+	 */
+	struct {
+		struct ptp_port_id  sender;
+		ptp_clk_id	    gm_id;
+	} best_id;
 	/* See clock_offset_is_outlier() */
 	uint8_t locked_syncs;
 	uint8_t outliers;
@@ -338,6 +345,53 @@ struct zsock_pollfd *ptp_clock_poll_sockets(void)
 	return &ptp_clk.pollfd[1];
 }
 
+/*
+ * Record the parent and grandmaster that best would make this clock follow,
+ * and report whether either differs from the last state decision. No best
+ * counts as this clock itself, as in linuxptp, so losing the time
+ * transmitter and finding it again is a change too.
+ */
+static bool clock_best_id_update(const struct ptp_foreign_tt_clock *best)
+{
+	struct ptp_port_id sender;
+	ptp_clk_id gm_id;
+	bool changed;
+
+	if (best) {
+		sender = best->dataset.sender;
+		gm_id = best->dataset.clk_id;
+	} else {
+		sender.clk_id = ptp_clk.default_ds.clk_id;
+		sender.port_number = 0;
+		gm_id = ptp_clk.default_ds.clk_id;
+	}
+
+	changed = !ptp_port_id_eq(&sender, &ptp_clk.best_id.sender) ||
+		  !ptp_clock_id_eq(&gm_id, &ptp_clk.best_id.gm_id);
+
+	ptp_clk.best_id.sender = sender;
+	ptp_clk.best_id.gm_id = gm_id;
+
+	return changed;
+}
+
+/*
+ * Forget what was measured against the previous parent. Its timestamps
+ * would pair with the new parent's into a nonsense path delay, its path
+ * delay is not the new path's, and a lock on it would hold back the new
+ * parent's offset as an outlier for CONFIG_PTP_OFFSET_OUTLIER_COUNT Syncs
+ * if the two disagree. ptp_clock_synchronize() waits for a new path delay
+ * before acting, as it does at startup.
+ */
+static void clock_sync_reset(void)
+{
+	memset(&ptp_clk.timestamp, 0, sizeof(ptp_clk.timestamp));
+	ptp_clk.current_ds.mean_delay = 0;
+	ptp_clk.current_ds.offset_from_tt = 0;
+	ptp_clk.locked_syncs = 0;
+	ptp_clk.outliers = 0;
+}
+
 void ptp_clock_handle_state_decision_evt(void)
 {
 	struct ptp_foreign_tt_clock *best = NULL, *foreign;
@@ -359,6 +413,12 @@ void ptp_clock_handle_state_decision_evt(void)
 	}
 
 	ptp_clk.best = best;
+
+	tt_changed = clock_best_id_update(best);
+	if (tt_changed) {
+		LOG_DBG("Time transmitter changed, resetting synchronization");
+		clock_sync_reset();
+	}
 
 	SYS_SLIST_FOR_EACH_CONTAINER(&ptp_clk.ports_list, port, node) {
 		enum ptp_port_state state;
