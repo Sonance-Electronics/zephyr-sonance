@@ -60,6 +60,9 @@ struct ptp_clock {
 		uint64_t	    t4;
 	} timestamp;			/* latest timestamps in nanoseconds */
 	double pi_drift;
+	/* See clock_offset_is_outlier() */
+	uint8_t locked_syncs;
+	uint8_t outliers;
 };
 
 __maybe_unused static struct ptp_clock ptp_clk = { 0 };
@@ -545,11 +548,61 @@ static double ptp_servo_pi(int64_t nanosecond_diff)
 	return ppb;
 }
 
+/* Consecutive acted-on Syncs within CONFIG_PTP_OFFSET_OUTLIER_NS that make
+ * the clock count as locked, see clock_offset_is_outlier().
+ */
+#define CLOCK_LOCKED_SYNCS 16
+
+/*
+ * Whether a Sync's offset should be held back as an outlier. Only a locked
+ * clock filters: one whose last CLOCK_LOCKED_SYNCS acted-on offsets were all
+ * within CONFIG_PTP_OFFSET_OUTLIER_NS. A run is needed, not just the last
+ * offset: while a clock slews out a large offset its servo overshoots, and
+ * an offset passing through the limit on the way is not lock. Treating it
+ * as lock held back the overshoot's correction, and the added delay made the
+ * servo ring between -31 and +6 ms after a 20 ms step that otherwise
+ * decayed smoothly. A jump beyond the limit is acted on only once
+ * CONFIG_PTP_OFFSET_OUTLIER_COUNT Syncs in a row show it, so a single bad
+ * timestamp is ignored while a real change of time is delayed by a few Sync
+ * intervals. A clock that is not locked, pulling in or recovering from a
+ * step, is not filtered and so not slowed.
+ *
+ * Seen on an i.MX RT1176 against a GPS time transmitter: about once in
+ * several hours, a Sync whose precise origin timestamp was 60 us before a
+ * second boundary carried a seconds field exactly one too high, with the
+ * nanoseconds right. The offset jumped from tens of ns to -1 s, the clock
+ * stepped by a second, stepped back on the next Sync, and took about 35 s
+ * to settle.
+ */
+static bool clock_offset_is_outlier(int64_t offset)
+{
+	const int64_t limit = CONFIG_PTP_OFFSET_OUTLIER_NS;
+	bool locked = ptp_clk.locked_syncs >= CLOCK_LOCKED_SYNCS;
+
+	if (limit == 0 || !locked || llabs(offset) <= limit) {
+		ptp_clk.outliers = 0;
+		return false;
+	}
+
+	if (++ptp_clk.outliers >= CONFIG_PTP_OFFSET_OUTLIER_COUNT) {
+		LOG_WRN("Offset %lldns persisted for %u Syncs, acting on it", offset,
+			ptp_clk.outliers);
+		ptp_clk.outliers = 0;
+		return false;
+	}
+
+	LOG_WRN("Discarding outlying offset %lldns (%u of %u)", offset, ptp_clk.outliers,
+		CONFIG_PTP_OFFSET_OUTLIER_COUNT);
+	return true;
+}
+
 void ptp_clock_synchronize(uint64_t ingress, uint64_t egress)
 {
 	double ppb;
 	int64_t offset;
 	int64_t delay = ptp_clk.current_ds.mean_delay >> 16;
+	uint64_t prev_t1 = ptp_clk.timestamp.t1;
+	uint64_t prev_t2 = ptp_clk.timestamp.t2;
 
 	ptp_clk.timestamp.t1 = egress;
 	ptp_clk.timestamp.t2 = ingress;
@@ -559,6 +612,15 @@ void ptp_clock_synchronize(uint64_t ingress, uint64_t egress)
 	}
 
 	offset = (int64_t)(ptp_clk.timestamp.t2 - ptp_clk.timestamp.t1) - delay;
+
+	if (clock_offset_is_outlier(offset)) {
+		/* Keep the previous pair, so the next Delay_Resp is not
+		 * measured against a bad timestamp either.
+		 */
+		ptp_clk.timestamp.t1 = prev_t1;
+		ptp_clk.timestamp.t2 = prev_t2;
+		return;
+	}
 
 	/* If diff is too big, ptp_clk needs to be set first. */
 	if ((offset > (int64_t)NSEC_PER_SEC) || (offset < -(int64_t)NSEC_PER_SEC)) {
@@ -593,11 +655,17 @@ void ptp_clock_synchronize(uint64_t ingress, uint64_t egress)
 		 */
 		ptp_clk.timestamp.t1 = 0;
 		ptp_clk.timestamp.t2 = 0;
+		ptp_clk.locked_syncs = 0;
 		return;
 	}
 
 	LOG_DBG("Offset %lldns", offset);
 	ptp_clk.current_ds.offset_from_tt = clock_ns_to_timeinterval(offset);
+	if (llabs(offset) > CONFIG_PTP_OFFSET_OUTLIER_NS) {
+		ptp_clk.locked_syncs = 0;
+	} else if (ptp_clk.locked_syncs < CLOCK_LOCKED_SYNCS) {
+		ptp_clk.locked_syncs++;
+	}
 
 	ppb = ptp_servo_pi(-offset);
 	ptp_clock_rate_adjust(ptp_clk.phc, 1.0 + (ppb / 1000000000.0));
