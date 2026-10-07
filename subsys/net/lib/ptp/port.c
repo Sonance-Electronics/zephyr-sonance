@@ -1394,7 +1394,13 @@ struct ptp_foreign_tt_clock *ptp_port_best_foreign(struct ptp_port *port)
 			continue;
 		}
 
-		last = (struct ptp_announce_msg *)k_fifo_peek_head(&foreign->messages);
+		/* The newest, which ptp_port_add_foreign_tt() appends at the
+		 * tail. The head is the oldest record still in the window, so
+		 * a change of grandmaster attributes would be ignored until it
+		 * aged out, and the state decision the change triggered would
+		 * be made on the old values.
+		 */
+		last = (struct ptp_announce_msg *)k_fifo_peek_tail(&foreign->messages);
 
 		foreign->dataset.priority1 = last->gm_priority1;
 		foreign->dataset.priority2 = last->gm_priority2;
@@ -1455,15 +1461,18 @@ int ptp_port_add_foreign_tt(struct ptp_port *port, struct ptp_msg *msg)
 	}
 
 	foreign_clock_cleanup(foreign);
-	ptp_msg_ref(msg);
 
-	foreign->messages_count++;
-	k_fifo_put(&foreign->messages, (void *)msg);
-
-	if (foreign->messages_count > 1) {
-		last = (struct ptp_msg *)k_fifo_peek_tail(&foreign->messages);
+	/* Compare with the previous Announce before queueing this one, which
+	 * would otherwise be the tail and so compare equal to itself.
+	 */
+	last = (struct ptp_msg *)k_fifo_peek_tail(&foreign->messages);
+	if (last) {
 		diff = ptp_msg_announce_cmp(&msg->announce, &last->announce);
 	}
+
+	ptp_msg_ref(msg);
+	foreign->messages_count++;
+	k_fifo_put(&foreign->messages, (void *)msg);
 
 	return (foreign->messages_count == FOREIGN_TIME_TRANSMITTER_THRESHOLD ? 1 : 0) || diff;
 }
@@ -1489,6 +1498,8 @@ void ptp_port_free_foreign_tts(struct ptp_port *port)
 int ptp_port_update_current_time_transmitter(struct ptp_port *port, struct ptp_msg *msg)
 {
 	struct ptp_foreign_tt_clock *foreign = port->best;
+	struct ptp_msg *last;
+	int diff = 0;
 
 	if (!foreign ||
 	    !ptp_port_id_eq(&msg->header.src_port_id, &foreign->dataset.sender)) {
@@ -1496,8 +1507,14 @@ int ptp_port_update_current_time_transmitter(struct ptp_port *port, struct ptp_m
 	}
 
 	foreign_clock_cleanup(foreign);
-	ptp_msg_ref(msg);
 
+	/* Before queueing this one; see ptp_port_add_foreign_tt(). */
+	last = (struct ptp_msg *)k_fifo_peek_tail(&foreign->messages);
+	if (last) {
+		diff = ptp_msg_announce_cmp(&msg->announce, &last->announce);
+	}
+
+	ptp_msg_ref(msg);
 	k_fifo_put(&foreign->messages, (void *)msg);
 	foreign->messages_count++;
 
@@ -1506,13 +1523,7 @@ int ptp_port_update_current_time_transmitter(struct ptp_port *port, struct ptp_m
 				      1,
 				      port->port_ds.log_announce_interval);
 
-	if (foreign->messages_count > 1) {
-		struct ptp_msg *last = (struct ptp_msg *)k_fifo_peek_tail(&foreign->messages);
-
-		return ptp_msg_announce_cmp(&msg->announce, &last->announce);
-	}
-
-	return 0;
+	return diff;
 }
 
 int ptp_port_management_msg_process(struct ptp_port *port,
