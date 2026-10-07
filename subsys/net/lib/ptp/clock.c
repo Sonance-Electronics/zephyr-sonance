@@ -31,10 +31,10 @@ LOG_MODULE_REGISTER(ptp_clock, CONFIG_PTP_LOG_LEVEL);
 #define MIN_NSEC_TO_TIMEINTERVAL (0xFFFF800000000000ULL)
 #define MAX_NSEC_TO_TIMEINTERVAL (0x00007FFFFFFFFFFFULL)
 
-/* A mean path delay at or beyond this is not a measurement but timestamps
- * taken either side of a clock step, see ptp_clock_delay().
+/* A mean path delay at or beyond this, either way, is not a measurement
+ * but a timestamp off by a second or more, see ptp_clock_delay().
  */
-#define MAX_PLAUSIBLE_DELAY_NS ((int64_t)NSEC_PER_SEC / 2)
+#define MAX_PLAUSIBLE_DELAY_NS ((int64_t)NSEC_PER_SEC / 4)
 
 /**
  * @brief PTP Clock structure.
@@ -747,9 +747,14 @@ void ptp_clock_delay(uint64_t egress, uint64_t ingress)
 		2LL;
 
 	/* A Delay_Req sent before a clock step and answered after it carries
-	 * a t3 in the old time base, so the result is off by half the step.
-	 * Steps are over 1 s, so that is over MAX_PLAUSIBLE_DELAY_NS. Discard
-	 * it rather than let it trigger another step.
+	 * a t3 in the old time base, so the result is off by half the step,
+	 * and steps are over 1 s. A single timestamp a second out, as a
+	 * transmitter's seconds field at a second boundary has been, moves it
+	 * by half a second. Either way the error is at least half a second,
+	 * in either direction, and the true delay is far smaller. Half a
+	 * second will not do as the limit: the true delay pushes an error of
+	 * +0.5 s beyond it but pulls one of -0.5 s just inside. Discard it
+	 * rather than let it trigger another step.
 	 */
 	if (delay >= MAX_PLAUSIBLE_DELAY_NS || delay <= -MAX_PLAUSIBLE_DELAY_NS) {
 		LOG_WRN("Discarding implausible path delay %lldns", delay);
