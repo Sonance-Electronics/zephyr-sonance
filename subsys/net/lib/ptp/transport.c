@@ -653,7 +653,7 @@ static int transport_recv_l2_msg(struct ptp_port *port, struct ptp_msg *msg)
 			}
 
 			LOG_ERR("Failed receive L2 PTP message (errno %d)", errno);
-			return cnt;
+			return -errno;
 		}
 	}
 
@@ -685,7 +685,12 @@ static int transport_recv_udp_msg(struct ptp_port *port, struct ptp_msg *msg, en
 
 	cnt = zsock_recvmsg(port->socket[idx], &msghdr, ZSOCK_MSG_DONTWAIT);
 	if (cnt < 0) {
-		LOG_ERR("Failed receive PTP message");
+		/* Return -errno, so a socket that has failed can be told from one
+		 * with nothing to read (EAGAIN), which is not a fault. The control
+		 * data is left alone: a failed receive leaves it zeroed.
+		 */
+		cnt = -errno;
+		LOG_DBG("Failed receive PTP message (%d)", cnt);
 		return cnt;
 	}
 
