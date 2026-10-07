@@ -353,7 +353,7 @@ void ptp_clock_handle_state_decision_evt(void)
 		if (!foreign) {
 			continue;
 		}
-		if (!best || ptp_btca_ds_cmp(&foreign->dataset, &best->dataset)) {
+		if (!best || ptp_btca_ds_cmp(&foreign->dataset, &best->dataset) > 0) {
 			best = foreign;
 		}
 	}

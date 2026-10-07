@@ -1408,7 +1408,7 @@ struct ptp_foreign_tt_clock *ptp_port_best_foreign(struct ptp_port *port)
 
 		if (!port->best) {
 			port->best = foreign;
-		} else if (ptp_btca_ds_cmp(&foreign->dataset, &port->best->dataset)) {
+		} else if (ptp_btca_ds_cmp(&foreign->dataset, &port->best->dataset) > 0) {
 			port->best = foreign;
 		} else {
 			port_clear_foreign_clock_records(foreign);
