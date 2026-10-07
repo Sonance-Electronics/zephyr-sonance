@@ -96,6 +96,20 @@ config PTP_OFFSET_OUTLIER_COUNT
 	  the filter. A genuine change of time, such as a new time
 	  transmitter, is delayed by this many Sync intervals less one.
 
+config PTP_SERVO_MAX_DRIFT_PPB
+	int "Limit of the servo's frequency estimate (ppb)"
+	default 500000
+	range 1 1000000000
+	help
+	  The PI servo's integral term is its estimate of how far the local
+	  clock's frequency is from the time transmitter's, and is limited to
+	  this many parts per billion either way. It only needs to cover the
+	  two oscillators' combined error, a few tens of ppm for crystals.
+	  Without a limit, one offset of nearly a second winds it up by tens
+	  of percent, which then takes many Sync intervals to unwind. The
+	  proportional term is not limited, so a large offset is still
+	  slewed out quickly.
+
 choice
 	prompt "PTP Clock Type"
 	default PTP_ORDINARY_CLOCK
