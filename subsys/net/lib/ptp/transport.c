@@ -316,7 +316,13 @@ int ptp_transport_recv(struct ptp_port *port, struct ptp_msg *msg, enum ptp_sock
 
 	cnt = zsock_recvmsg(port->socket[idx], &msghdr, ZSOCK_MSG_DONTWAIT);
 	if (cnt < 0) {
-		LOG_ERR("Failed receive PTP message");
+		/* Before walking the control data, which a failed receive
+		 * leaves zeroed: a zero cmsg_len makes NET_CMSG_NXTHDR()
+		 * return the same header for ever.
+		 */
+		cnt = -errno;
+		LOG_DBG("Failed receive PTP message (%d)", cnt);
+		return cnt;
 	}
 
 	for (cmsg = NET_CMSG_FIRSTHDR(&msghdr); cmsg != NULL;
@@ -329,6 +335,16 @@ int ptp_transport_recv(struct ptp_port *port, struct ptp_msg *msg, enum ptp_sock
 	}
 
 	return cnt;
+}
+
+void ptp_transport_drop(struct ptp_port *port, enum ptp_socket idx)
+{
+	__ASSERT(PTP_SOCKET_CNT > idx, "Invalid socket index");
+
+	uint8_t byte;
+
+	/* A datagram socket discards whatever of the datagram does not fit */
+	(void)zsock_recv(port->socket[idx], &byte, sizeof(byte), ZSOCK_MSG_DONTWAIT);
 }
 
 int ptp_transport_protocol_addr(struct ptp_port *port, uint8_t *addr)

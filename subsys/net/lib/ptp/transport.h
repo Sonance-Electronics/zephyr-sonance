@@ -96,6 +96,14 @@ int ptp_transport_sendto(struct ptp_port *port, struct ptp_msg *msg, enum ptp_so
 int ptp_transport_recv(struct ptp_port *port, struct ptp_msg *msg, enum ptp_socket idx);
 
 /**
+ * @brief Function discarding the next message waiting on a PTP socket.
+ *
+ * @param[in] port Pointer to the PTP Port structure.
+ * @param[in] idx Index of the socket.
+ */
+void ptp_transport_drop(struct ptp_port *port, enum ptp_socket idx);
+
+/**
  * @brief Function for getting transport's protocol address.
  *
  * @param[in] port Pointer to the PTP Port structure.

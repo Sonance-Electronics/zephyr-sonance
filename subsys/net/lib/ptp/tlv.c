@@ -331,10 +331,13 @@ static void tlv_mgmt_pre_send(struct ptp_tlv_mgmt *mgmt_tlv)
 struct ptp_tlv_container *ptp_tlv_alloc(void)
 {
 	struct ptp_tlv_container *tlv_container = NULL;
-	int ret = k_mem_slab_alloc(&tlv_slab, (void **)&tlv_container, K_FOREVER);
+	/* Never wait, as in ptp_msg_alloc(): the PTP thread is the only one
+	 * freeing TLVs.
+	 */
+	int ret = k_mem_slab_alloc(&tlv_slab, (void **)&tlv_container, K_NO_WAIT);
 
 	if (ret) {
-		LOG_ERR("Couldn't allocate memory for the TLV");
+		LOG_DBG("Couldn't allocate memory for the TLV");
 		return NULL;
 	}
 

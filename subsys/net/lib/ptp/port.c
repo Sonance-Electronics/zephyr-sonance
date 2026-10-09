@@ -1111,20 +1111,37 @@ enum ptp_port_event ptp_port_event_gen(struct ptp_port *port, int idx)
 
 	msg = ptp_msg_alloc();
 	if (!msg) {
-		return PTP_EVT_FAULT_DETECTED;
+		/* Out of messages for now: lose this one, not the port. It
+		 * must still be read, or the socket stays readable and the
+		 * poll returns straight away.
+		 */
+		LOG_DBG("No message buffer, dropping a received message");
+		ptp_transport_drop(port, idx);
+		return PTP_EVT_NONE;
 	}
 
+	/*
+	 * A fault resets the port and loses the time transmitter, so keep it
+	 * for a socket that has actually failed. An empty or malformed
+	 * datagram, which any host can send, and a wakeup with nothing to
+	 * read are dropped instead.
+	 */
 	cnt = ptp_transport_recv(port, msg, idx);
-	if (cnt <= 0) {
-		LOG_ERR("Error during message reception");
+	if (cnt == 0 || cnt == -EAGAIN || cnt == -EWOULDBLOCK) {
+		ptp_msg_unref(msg);
+		return PTP_EVT_NONE;
+	}
+	if (cnt < 0) {
+		LOG_ERR("Error during message reception (%d)", cnt);
 		ptp_msg_unref(msg);
 		return PTP_EVT_FAULT_DETECTED;
 	}
 
 	ret = ptp_msg_post_recv(port, msg, cnt);
 	if (ret) {
+		LOG_DBG("Dropping a malformed message");
 		ptp_msg_unref(msg);
-		return PTP_EVT_FAULT_DETECTED;
+		return PTP_EVT_NONE;
 	}
 
 	if (ptp_port_id_eq(&msg->header.src_port_id, &port->port_ds.id)) {
@@ -1460,13 +1477,11 @@ void ptp_port_free_foreign_tts(struct ptp_port *port)
 		iter = sys_slist_get(&port->foreign_list);
 		foreign = CONTAINER_OF(iter, struct ptp_foreign_tt_clock, node);
 
-		while (foreign->messages_count > FOREIGN_TIME_TRANSMITTER_THRESHOLD) {
-			struct ptp_msg *msg = (struct ptp_msg *)k_fifo_get(&foreign->messages,
-									   K_NO_WAIT);
-			foreign->messages_count--;
-			ptp_msg_unref(msg);
-		}
-
+		/* All of them: the record is about to be freed, and stopping at
+		 * FOREIGN_TIME_TRANSMITTER_THRESHOLD, as cleanup does, leaked up
+		 * to that many Announce messages each time a port was disabled.
+		 */
+		port_clear_foreign_clock_records(foreign);
 		k_mem_slab_free(&foreign_tts_slab, (void *)foreign);
 	}
 }
@@ -1569,6 +1584,7 @@ int ptp_port_management_resp(struct ptp_port *port, struct ptp_msg *req, struct 
 
 	ret = port_management_resp_tlv_fill(port, req, resp, tlv);
 	if (ret) {
+		ptp_msg_unref(resp);
 		return ret;
 	}
 

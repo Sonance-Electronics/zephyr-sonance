@@ -140,7 +140,7 @@ static uint8_t *msg_suffix(struct ptp_msg *msg)
 
 static int msg_tlv_post_recv(struct ptp_msg *msg, int length)
 {
-	int suffix_len = 0, ret = 0;
+	int suffix_len = 0, ret = 0, count = 0;
 	struct ptp_tlv_container *tlv_container;
 	uint8_t *suffix = msg_suffix(msg);
 
@@ -150,6 +150,14 @@ static int msg_tlv_post_recv(struct ptp_msg *msg, int length)
 	}
 
 	while (length >= sizeof(struct ptp_tlv)) {
+		/* Bound what one received message can hold of the TLV pool,
+		 * which every message shares.
+		 */
+		if (++count > CONFIG_PTP_MSG_MAX_TLVS) {
+			LOG_DBG("More than %d TLVs in a message", CONFIG_PTP_MSG_MAX_TLVS);
+			return -EBADMSG;
+		}
+
 		tlv_container = ptp_tlv_alloc();
 		if (!tlv_container) {
 			return -ENOMEM;
@@ -161,7 +169,7 @@ static int msg_tlv_post_recv(struct ptp_msg *msg, int length)
 
 		if (tlv_container->tlv->length % 2) {
 			/* IEEE 1588-2019 Section 5.3.8 - length is an even number */
-			LOG_ERR("Incorrect length of TLV");
+			LOG_DBG("Incorrect length of TLV");
 			ptp_tlv_free(tlv_container);
 			return -EBADMSG;
 		}
@@ -171,7 +179,7 @@ static int msg_tlv_post_recv(struct ptp_msg *msg, int length)
 		suffix_len += sizeof(struct ptp_tlv);
 
 		if (tlv_container->tlv->length > length) {
-			LOG_ERR("Incorrect length of TLV");
+			LOG_DBG("Incorrect length of TLV");
 			ptp_tlv_free(tlv_container);
 			return -EBADMSG;
 		}
@@ -219,10 +227,14 @@ static void msg_tlv_pre_send(struct ptp_msg *msg)
 struct ptp_msg *ptp_msg_alloc(void)
 {
 	struct ptp_msg *msg = NULL;
-	int ret = k_mem_slab_alloc(&msg_slab, (void **)&msg, K_FOREVER);
+	/* Never wait: only the PTP thread frees messages, and it is also the
+	 * thread allocating, so waiting for one blocked it for good once the
+	 * pool ran out.
+	 */
+	int ret = k_mem_slab_alloc(&msg_slab, (void **)&msg, K_NO_WAIT);
 
 	if (ret) {
-		LOG_ERR("Couldn't allocate memory for the message");
+		LOG_DBG("Couldn't allocate memory for the message");
 		return NULL;
 	}
 
@@ -369,13 +381,21 @@ int ptp_msg_post_recv(struct ptp_port *port, struct ptp_msg *msg, int cnt)
 	int64_t current;
 	int tlv_len;
 
-	if (msg_size[type] > cnt) {
-		LOG_ERR("Received message with incorrect length");
+	/* Messages come from any host, so these are not errors of ours, and
+	 * logging each at error level would let one flood the log.
+	 *
+	 * The type is four bits but msg_size[] stops at MANAGEMENT, and the
+	 * reserved types in it have no size, so check both the index and the
+	 * header.
+	 */
+	if (type >= ARRAY_SIZE(msg_size) || cnt < (int)sizeof(struct ptp_header) ||
+	    msg_size[type] > cnt) {
+		LOG_DBG("Received message with incorrect type or length");
 		return -EBADMSG;
 	}
 
 	if (msg_header_post_recv(&msg->header)) {
-		LOG_ERR("Received message incomplient with supported PTP version");
+		LOG_DBG("Received message incomplient with supported PTP version");
 		return -EBADMSG;
 	}
 
@@ -425,12 +445,12 @@ int ptp_msg_post_recv(struct ptp_port *port, struct ptp_msg *msg, int cnt)
 
 	tlv_len = msg_tlv_post_recv(msg, cnt - msg_size[type]);
 	if (tlv_len < 0) {
-		LOG_ERR("Failed processing TLVs");
+		LOG_DBG("Failed processing TLVs");
 		return -EBADMSG;
 	}
 
 	if (msg_size[type] + tlv_len != msg->header.msg_length) {
-		LOG_ERR("Length and TLVs don't correspond with specified in the message");
+		LOG_DBG("Length and TLVs don't correspond with specified in the message");
 		return -EMSGSIZE;
 	}
 
@@ -462,6 +482,11 @@ struct ptp_tlv *ptp_msg_add_tlv(struct ptp_msg *msg, int length)
 	if (tlv_container) {
 		tlv_container->tlv = (struct ptp_tlv *)suffix;
 		msg->header.msg_length += length;
+		/* On the list, msg_tlv_pre_send() converts it to network
+		 * order and frees it. Off it, it was sent in host order and
+		 * never freed.
+		 */
+		sys_slist_append(&msg->tlvs, &tlv_container->node);
 	}
 
 	return tlv_container ? tlv_container->tlv : NULL;
