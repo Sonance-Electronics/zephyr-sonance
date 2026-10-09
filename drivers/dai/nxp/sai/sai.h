@@ -552,14 +552,24 @@ static inline uint32_t *sai_csr_off(struct sai_data *data, enum dai_dir dir)
  * DMA requests right after clearing RE left the receiver enabled for good.
  * So the enable bits a disable has asked to clear are kept in *_csr_off and
  * always written as 0, until START enables the direction again.
+ *
+ * The update runs with interrupts locked, as the FIFO error ISR updates the
+ * same registers.
  */
 static inline void sai_tx_rx_csr_update(struct sai_data *data, enum dai_dir dir, uint32_t clear,
 					uint32_t set)
 {
 	I2S_Type *base = UINT_TO_I2S(data->regmap);
 	volatile uint32_t *csr = dir == DAI_DIR_RX ? &base->RCSR : &base->TCSR;
+	unsigned int key;
 
+	/* the FIFO error ISR also updates these registers, to halt a
+	 * direction; a read-modify-write it interrupted would write back
+	 * the interrupt and DMA enables it had just cleared
+	 */
+	key = irq_lock();
 	*csr = (((*csr & ~SAI_CSR_W1C_MASK) & ~clear) | set) & ~*sai_csr_off(data, dir);
+	irq_unlock(key);
 }
 
 /* Ask the hardware to clear enable bits of a direction (SAI_CSR_XE_MASK and
