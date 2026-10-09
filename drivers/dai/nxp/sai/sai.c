@@ -837,7 +837,7 @@ static int sai_trigger_stop(const struct device *dev,
 	struct sai_data *data;
 	const struct sai_config *cfg;
 	int ret, pm_ret;
-	uint32_t old_state;
+	uint32_t old_state, other_state;
 
 	data = dev->data;
 	cfg = dev->config;
@@ -872,7 +872,17 @@ static int sai_trigger_stop(const struct device *dev,
 	/* disable error interrupt */
 	sai_tx_rx_irq_enable(data, dir, kSAI_FIFOErrorInterruptEnable, false);
 
-	irq_disable(cfg->irq);
+	/* TX and RX share the interrupt, so only turn it off once the other
+	 * direction cannot raise a FIFO error either: it is not running,
+	 * paused, or halted until dai_nxp_sai_recover(). Turning it off
+	 * regardless left a running direction's FIFO errors unhandled until
+	 * its next START.
+	 */
+	other_state = sai_get_state(dir == DAI_DIR_TX ? DAI_DIR_RX : DAI_DIR_TX, data);
+	if (other_state != DAI_STATE_RUNNING && other_state != DAI_STATE_PAUSED &&
+	    other_state != DAI_STATE_ERROR) {
+		irq_disable(cfg->irq);
+	}
 
 	/* With the SAI providing the bit clock this does not wait. The DMA
 	 * requests are already off, so whatever the direction receives in the
@@ -1047,8 +1057,6 @@ static int sai_trigger_start(const struct device *dev,
 
 	sai_tx_rx_sw_reset(data, dirs);
 
-	irq_enable(cfg->irq);
-
 	/* a FIFO error that halted this direction leaves its flag set (see
 	 * sai_fifo_error()); clear it so it neither holds the FIFO nor raises
 	 * an interrupt the moment the error interrupt is enabled
@@ -1069,6 +1077,12 @@ static int sai_trigger_start(const struct device *dev,
 	sai_tx_rx_dma_enable(data, dir, true);
 
 out_enable_dline:
+	/* the interrupt is shared with the other direction, whose STOP may
+	 * have turned it off while this one was paused, so a resume needs it
+	 * as much as a start does
+	 */
+	irq_enable(cfg->irq);
+
 	/* enable TX/RX data line. This translates to TX_DLINE0/RX_DLINE0
 	 * being enabled.
 	 *
