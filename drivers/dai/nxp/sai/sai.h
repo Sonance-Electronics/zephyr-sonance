@@ -7,6 +7,7 @@
 #define ZEPHYR_DRIVERS_DAI_NXP_SAI_H_
 
 #include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/dai/nxp_sai.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/logging/log.h>
 #include <fsl_sai.h>
@@ -226,11 +227,6 @@
 	((enable == true) ? _SAI_TX_RX_ENABLE_IRQ(dir, regmap, which) :\
 	 _SAI_TX_RX_DISABLE_IRQ(dir, regmap, which))
 
-/* used to check if a status flag is set */
-#define SAI_TX_RX_STATUS_IS_SET(dir, regmap, which)\
-	((dir) == DAI_DIR_RX ? ((UINT_TO_I2S(regmap))->RCSR & (which)) : \
-	 ((UINT_TO_I2S(regmap))->TCSR & (which)))
-
 /* used to clear status flags */
 #define SAI_TX_RX_STATUS_CLEAR(dir, regmap, which)						\
 	((dir) == DAI_DIR_RX ? SAI_RxClearStatusFlags(UINT_TO_I2S(regmap), which)		\
@@ -278,6 +274,11 @@ struct sai_data {
 	enum dai_state tx_state;
 	enum dai_state rx_state;
 	struct dai_config cfg;
+	/* FIFO errors since boot, see dai_nxp_sai_get_status() */
+	uint32_t tx_fifo_errors;
+	uint32_t rx_fifo_errors;
+	dai_nxp_sai_error_cb_t error_cb;
+	void *error_cb_data;
 };
 
 struct sai_config {
@@ -459,9 +460,26 @@ static inline uint32_t sai_get_state(enum dai_dir dir,
 	}
 }
 
-static int sai_update_state(enum dai_dir dir,
-			    struct sai_data *data,
-			    enum dai_state new_state)
+/* halt a direction on a FIFO error: DMA requests and error interrupt off */
+static inline void sai_tx_rx_halt(struct sai_data *data, enum dai_dir dir)
+{
+	SAI_TX_RX_DMA_ENABLE_DISABLE(dir, data->regmap, false);
+	SAI_TX_RX_ENABLE_DISABLE_IRQ(dir, data->regmap, kSAI_FIFOErrorInterruptEnable, false);
+}
+
+/* true if a direction's FIFO error flag is set and its error interrupt enabled */
+static inline bool sai_tx_rx_fifo_error_pending(struct sai_data *data, enum dai_dir dir)
+{
+	const uint32_t mask = kSAI_FIFOErrorFlag | kSAI_FIFOErrorInterruptEnable;
+	I2S_Type *base = UINT_TO_I2S(data->regmap);
+	uint32_t csr = dir == DAI_DIR_RX ? base->RCSR : base->TCSR;
+
+	return (csr & mask) == mask;
+}
+
+static int sai_update_state_locked(enum dai_dir dir,
+				   struct sai_data *data,
+				   enum dai_state new_state)
 {
 	enum dai_state old_state = sai_get_state(dir, data);
 
@@ -492,13 +510,19 @@ static int sai_update_state(enum dai_dir dir,
 		}
 		break;
 	case DAI_STATE_STOPPING:
-		if (old_state != DAI_STATE_READY &&
-		    old_state != DAI_STATE_RUNNING &&
-		    old_state != DAI_STATE_PAUSED) {
+		if (old_state != DAI_STATE_READY && old_state != DAI_STATE_RUNNING &&
+		    old_state != DAI_STATE_PAUSED && old_state != DAI_STATE_ERROR) {
 			return -EPERM;
 		}
 		break;
 	case DAI_STATE_ERROR:
+		/* entered from the ISR when a FIFO error halts a running
+		 * direction; left only through a stop
+		 */
+		if (old_state != DAI_STATE_RUNNING) {
+			return -EPERM;
+		}
+		break;
 	case DAI_STATE_PRE_RUNNING:
 		/* these states are not used so transitioning to them
 		 * is considered invalid.
@@ -516,6 +540,27 @@ static int sai_update_state(enum dai_dir dir,
 	return 0;
 }
 
+/*
+ * The ISR moves a RUNNING direction to ERROR on a FIFO error, so the
+ * check and the update must not be split by it: a pause that read RUNNING
+ * would otherwise overwrite the ERROR the ISR just set, leaving a direction
+ * marked PAUSED, then RUNNING, whose DMA requests the ISR had already
+ * turned off and whose error interrupt it had masked.
+ */
+static int sai_update_state(enum dai_dir dir,
+			    struct sai_data *data,
+			    enum dai_state new_state)
+{
+	unsigned int key;
+	int ret;
+
+	key = irq_lock();
+	ret = sai_update_state_locked(dir, data, new_state);
+	irq_unlock(key);
+
+	return ret;
+}
+
 static inline void sai_tx_rx_force_disable(enum dai_dir dir,
 					   uint32_t regmap)
 {
@@ -525,6 +570,22 @@ static inline void sai_tx_rx_force_disable(enum dai_dir dir,
 		base->RCSR = ((base->RCSR & 0xFFE3FFFFU) & (~I2S_RCSR_RE_MASK));
 	} else {
 		base->TCSR = ((base->TCSR & 0xFFE3FFFFU) & (~I2S_TCSR_TE_MASK));
+	}
+}
+
+/* Empty a direction's FIFO without touching its write-1-to-clear status
+ * flags. SAI_TxSoftwareReset()/SAI_RxSoftwareReset() set FR with |=, which
+ * writes a set FEF back as 1 and so clears it in the same write; recovering
+ * from a FIFO error needs the FIFO emptied while FEF is still set.
+ */
+static inline void sai_tx_rx_fifo_reset(enum dai_dir dir, uint32_t regmap)
+{
+	I2S_Type *base = UINT_TO_I2S(regmap);
+
+	if (dir == DAI_DIR_RX) {
+		base->RCSR = (base->RCSR & 0xFFE3FFFFU) | I2S_RCSR_FR_MASK;
+	} else {
+		base->TCSR = (base->TCSR & 0xFFE3FFFFU) | I2S_TCSR_FR_MASK;
 	}
 }
 
