@@ -1170,6 +1170,15 @@ enum ptp_port_event ptp_port_event_gen(struct ptp_port *port, int idx)
 		return PTP_EVT_NONE;
 	}
 
+	/* A PTP instance belongs to one domain and ignores messages from any
+	 * other (IEEE 1588-2019 7.1). Nothing checked this, so another
+	 * domain's Announces took part in this clock's best master election.
+	 */
+	if (msg->header.domain_number != ptp_clock_default_ds()->domain) {
+		ptp_msg_unref(msg);
+		return PTP_EVT_NONE;
+	}
+
 	switch (ptp_msg_type(msg)) {
 	case PTP_MSG_SYNC:
 		port_sync_msg_process(port, msg);

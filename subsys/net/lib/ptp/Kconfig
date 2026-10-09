@@ -72,6 +72,16 @@ config PTP_MSG_MAX_TLVS
 	  PTP_MSG_POLL_SIZE in size, so this bounds how much of it one
 	  message from the network can take.
 
+config PTP_MGMT_SET_ENABLE
+	bool "Honour management SET messages"
+	default n
+	help
+	  Act on PTP management SET messages received from the network, which
+	  change clock settings such as priority1 and priority2. They are not
+	  authenticated, so any host on the network can send them: one that
+	  sets priority1 to 0 makes this clock win the best master election.
+	  Off by default; a received SET is ignored. GET is always answered.
+
 config PTP_OFFSET_OUTLIER_NS
 	int "Offset that a locked clock treats as a possible outlier (ns)"
 	default 1000000

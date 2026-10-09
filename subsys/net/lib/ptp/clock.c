@@ -183,6 +183,15 @@ static int clock_management_set(struct ptp_port *port,
 {
 	bool send_resp = false;
 
+	if (!IS_ENABLED(CONFIG_PTP_MGMT_SET_ENABLE)) {
+		/* Unauthenticated, so acting on it lets any host change the
+		 * clock; see the Kconfig option. Ignore it without a reply,
+		 * rather than answer an error to a possibly spoofed source.
+		 */
+		LOG_DBG("Ignoring management SET (CONFIG_PTP_MGMT_SET_ENABLE off)");
+		return 0;
+	}
+
 	switch (tlv->id) {
 	case PTP_MGMT_PRIORITY1:
 		ptp_clk.default_ds.priority1 = *tlv->data;
