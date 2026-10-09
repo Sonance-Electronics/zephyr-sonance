@@ -49,17 +49,38 @@ config ADJUST_LDO
 	default y
 	bool "Adjust LDO setting"
 
-config ENET_PTP_CLOCK_USE_XTAL
-	default n
-	bool "Use external 24 MHz crystal for ENET PTP clock"
+choice ENET_PTP_CLOCK_SOURCE
+	prompt "ENET PTP clock source"
+	default ENET_PTP_CLOCK_USE_RC48M
 	depends on PTP_CLOCK_NXP_ENET
+	help
+	  Source of ENET_TIMER1_CLK_ROOT, which clocks the ENET IEEE 1588
+	  timer.
+
+config ENET_PTP_CLOCK_USE_RC48M
+	bool "Internal 48 MHz RC oscillator divided by two (24 MHz)"
+
+config ENET_PTP_CLOCK_USE_XTAL
+	bool "External 24 MHz crystal"
 	help
 	  Use the external 24 MHz crystal oscillator instead of the internal
 	  48 MHz RC oscillator divided by two for the ENET timestamp clock.
 	  Both sources provide a nominal 24 MHz clock, but a crystal generally
 	  offers better long-term frequency stability for PTP synchronization.
-	  Boards with a suitable external crystal can opt in; leave disabled
-	  to preserve the existing RC clock source on other boards.
+
+config ENET_PTP_CLOCK_USE_SYS_PLL1
+	bool "SYS_PLL1 divided by 2 and by 20 (25 MHz)"
+	depends on ETH_NXP_ENET
+	help
+	  Clock the timer at 25 MHz from SYS_PLL1_DIV2, the source of the
+	  ENET reference clock. SYS_PLL1 is locked to the 24 MHz crystal, so
+	  the stability is the crystal's. At 24 MHz a tick is 41.667 ns, and
+	  holding the nominal rate already takes the timer's correction
+	  mechanism, leaving rate adjustment steps of about 60 ppm. A 25 MHz
+	  tick is exactly 40 ns, which leaves the 31-bit correction period
+	  free for adjustment, giving steps far below 1 ppm.
+
+endchoice
 
 config INIT_VIDEO_PLL
 	default y
