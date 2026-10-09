@@ -151,7 +151,12 @@ static int cmd_set_prop(const struct shell *sh, size_t argc, char *argv[])
 		property_value.mute = value;
 		break;
 	default:
-		return -EINVAL;
+		/* Codec-specific properties are given by number, as an int. */
+		if (property < AUDIO_PROPERTY_PRIV_START) {
+			return -EINVAL;
+		}
+		property_value.vol = value;
+		break;
 	}
 
 	return audio_codec_set_property(dev, property, channel, property_value);
