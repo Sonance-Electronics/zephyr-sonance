@@ -54,8 +54,9 @@ choice ENET_PTP_CLOCK_SOURCE
 	default ENET_PTP_CLOCK_USE_RC48M
 	depends on PTP_CLOCK_NXP_ENET
 	help
-	  Source of ENET_TIMER1_CLK_ROOT, which clocks the ENET IEEE 1588
-	  timer.
+	  Source of ENET_TIMER1_CLK_ROOT and ENET_TIMER2_CLK_ROOT, which
+	  clock the IEEE 1588 timers of ENET and ENET_1G respectively. Each
+	  root is set only when its ENET instance is enabled.
 
 config ENET_PTP_CLOCK_USE_RC48M
 	bool "Internal 48 MHz RC oscillator divided by two (24 MHz)"

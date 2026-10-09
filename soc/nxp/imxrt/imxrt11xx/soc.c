@@ -438,20 +438,38 @@ __weak void clock_init(void)
 #endif
 
 #if defined(CONFIG_PTP_CLOCK_NXP_ENET)
+	/*
+	 * Each ENET instance has its own 1588 timer root: ENET_TIMER1 for
+	 * ENET and ENET_TIMER2 for ENET_1G. Both take the source chosen by
+	 * ENET_PTP_CLOCK_SOURCE.
+	 */
 #if defined(CONFIG_ENET_PTP_CLOCK_USE_SYS_PLL1)
 	/* 25 MHz PTP clock, exactly 40 ns per tick */
-	rootCfg.mux = kCLOCK_ENET_TIMER1_ClockRoot_MuxSysPll1Div2;
 	rootCfg.div = 20;
 #else
 	/* 24MHz PTP clock */
-#if defined(CONFIG_ENET_PTP_CLOCK_USE_XTAL)
+	rootCfg.div = 1;
+#endif
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(enet))
+#if defined(CONFIG_ENET_PTP_CLOCK_USE_SYS_PLL1)
+	rootCfg.mux = kCLOCK_ENET_TIMER1_ClockRoot_MuxSysPll1Div2;
+#elif defined(CONFIG_ENET_PTP_CLOCK_USE_XTAL)
 	rootCfg.mux = kCLOCK_ENET_TIMER1_ClockRoot_MuxOsc24MOut;
 #else
 	rootCfg.mux = kCLOCK_ENET_TIMER1_ClockRoot_MuxOscRc48MDiv2;
 #endif
-	rootCfg.div = 1;
-#endif
 	CLOCK_SetRootClock(kCLOCK_Root_Enet_Timer1, &rootCfg);
+#endif
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(enet1g))
+#if defined(CONFIG_ENET_PTP_CLOCK_USE_SYS_PLL1)
+	rootCfg.mux = kCLOCK_ENET_TIMER2_ClockRoot_MuxSysPll1Div2;
+#elif defined(CONFIG_ENET_PTP_CLOCK_USE_XTAL)
+	rootCfg.mux = kCLOCK_ENET_TIMER2_ClockRoot_MuxOsc24MOut;
+#else
+	rootCfg.mux = kCLOCK_ENET_TIMER2_ClockRoot_MuxOscRc48MDiv2;
+#endif
+	CLOCK_SetRootClock(kCLOCK_Root_Enet_Timer2, &rootCfg);
+#endif
 #endif
 
 #ifdef CONFIG_SPI_NXP_LPSPI
