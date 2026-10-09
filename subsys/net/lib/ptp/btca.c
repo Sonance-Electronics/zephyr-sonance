@@ -73,7 +73,7 @@ static int btca_ds_cmp2(const struct ptp_dataset *a, const struct ptp_dataset *b
 	if (a->receiver.port_number > b->receiver.port_number) {
 		return B_BETTER_TOPOLOGY;
 	}
-	if (a->receiver.port_number > b->receiver.port_number) {
+	if (a->receiver.port_number < b->receiver.port_number) {
 		return A_BETTER_TOPOLOGY;
 	}
 	/* error-2 */

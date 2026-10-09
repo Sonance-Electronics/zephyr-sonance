@@ -418,10 +418,10 @@ static void foreign_clock_cleanup(struct ptp_foreign_tt_clock *foreign)
 		} else if (msg->header.log_msg_interval >= 31) {
 			timeout = INT64_MAX;
 		} else if (msg->header.log_msg_interval > 0) {
-			timeout = FOREIGN_TIME_TRANSMITTER_TIME_WINDOW_MUL *
+			timeout = (int64_t)FOREIGN_TIME_TRANSMITTER_TIME_WINDOW_MUL *
 				  (1 << msg->header.log_msg_interval) * NSEC_PER_SEC;
 		} else {
-			timeout = FOREIGN_TIME_TRANSMITTER_TIME_WINDOW_MUL * NSEC_PER_SEC /
+			timeout = (int64_t)FOREIGN_TIME_TRANSMITTER_TIME_WINDOW_MUL * NSEC_PER_SEC /
 				  (1 << (-msg->header.log_msg_interval));
 		}
 
@@ -497,6 +497,19 @@ static void port_clear_delay_req(struct ptp_port *port)
 	k_spin_unlock(&port->delay_req_lock, key);
 
 	port_delay_req_list_unref(&cleared);
+}
+
+/* Drop a Sync awaiting its Follow_Up, or the reverse, and the outstanding
+ * Delay_Reqs, when what they measure no longer applies.
+ */
+static void port_clear_sync(struct ptp_port *port)
+{
+	if (port->last_sync_fup) {
+		ptp_msg_unref(port->last_sync_fup);
+		port->last_sync_fup = NULL;
+	}
+
+	port_clear_delay_req(port);
 }
 
 static void port_sync_fup_ooo_handle(struct ptp_port *port, struct ptp_msg *msg)
@@ -699,6 +712,14 @@ static void port_delay_resp_msg_process(struct ptp_port *port, struct ptp_msg *m
 
 	if (!ptp_port_id_eq(&msg->delay_resp.req_port_id, &port->port_ds.id)) {
 		/* Message is not meant for this PTP Port */
+		return;
+	}
+
+	/* As for Sync and Follow_Up. Delay_Req is multicast, so after a
+	 * parent change the previous parent, if still a time transmitter,
+	 * answers too, with a t4 from its own clock.
+	 */
+	if (!ptp_msg_current_parent(msg)) {
 		return;
 	}
 
@@ -1200,6 +1221,27 @@ void ptp_port_event_handle(struct ptp_port *port, enum ptp_port_event event, boo
 		return;
 	}
 
+	/* The state machine acts on tt_diff only through UNCALIBRATED,
+	 * which is optional, and only from some states.
+	 */
+	if (tt_diff) {
+		port_clear_sync(port);
+
+		/* The Sync receipt timer was armed by the previous parent's
+		 * last Sync, for three of its Sync intervals. A new parent that
+		 * syncs less often than that cannot get its first Sync in
+		 * before it fires, which drops the new parent's records and
+		 * reverts to the old one: with 4 Syncs/s from the old parent
+		 * and 1/s from the new, the switch was undone indefinitely.
+		 * Give the new parent an Announce receipt timeout instead; its
+		 * first Sync re-arms the timer for its own interval.
+		 */
+		atomic_clear_bit(&port->timeouts, PTP_PORT_TIMER_SYNC_TO);
+		port_timer_set_timeout(&port->timers.sync,
+				       port->port_ds.announce_receipt_timeout,
+				       port->port_ds.log_announce_interval);
+	}
+
 	if (!port_state_update(port, event, tt_diff)) {
 		/* No PTP Port state change */
 		return;
@@ -1244,11 +1286,7 @@ void ptp_port_event_handle(struct ptp_port *port, enum ptp_port_event event, boo
 					      port->port_ds.log_announce_interval);
 		break;
 	case PTP_PS_UNCALIBRATED:
-		if (port->last_sync_fup) {
-			ptp_msg_unref(port->last_sync_fup);
-			port->last_sync_fup = NULL;
-		}
-		port_clear_delay_req(port);
+		port_clear_sync(port);
 		__fallthrough;
 	case PTP_PS_TIME_RECEIVER:
 		port_timer_set_timeout_random(&port->timers.announce,
@@ -1394,7 +1432,13 @@ struct ptp_foreign_tt_clock *ptp_port_best_foreign(struct ptp_port *port)
 			continue;
 		}
 
-		last = (struct ptp_announce_msg *)k_fifo_peek_head(&foreign->messages);
+		/* The newest, which ptp_port_add_foreign_tt() appends at the
+		 * tail. The head is the oldest record still in the window, so
+		 * a change of grandmaster attributes would be ignored until it
+		 * aged out, and the state decision the change triggered would
+		 * be made on the old values.
+		 */
+		last = (struct ptp_announce_msg *)k_fifo_peek_tail(&foreign->messages);
 
 		foreign->dataset.priority1 = last->gm_priority1;
 		foreign->dataset.priority2 = last->gm_priority2;
@@ -1408,7 +1452,7 @@ struct ptp_foreign_tt_clock *ptp_port_best_foreign(struct ptp_port *port)
 
 		if (!port->best) {
 			port->best = foreign;
-		} else if (ptp_btca_ds_cmp(&foreign->dataset, &port->best->dataset)) {
+		} else if (ptp_btca_ds_cmp(&foreign->dataset, &port->best->dataset) > 0) {
 			port->best = foreign;
 		} else {
 			port_clear_foreign_clock_records(foreign);
@@ -1455,15 +1499,18 @@ int ptp_port_add_foreign_tt(struct ptp_port *port, struct ptp_msg *msg)
 	}
 
 	foreign_clock_cleanup(foreign);
-	ptp_msg_ref(msg);
 
-	foreign->messages_count++;
-	k_fifo_put(&foreign->messages, (void *)msg);
-
-	if (foreign->messages_count > 1) {
-		last = (struct ptp_msg *)k_fifo_peek_tail(&foreign->messages);
+	/* Compare with the previous Announce before queueing this one, which
+	 * would otherwise be the tail and so compare equal to itself.
+	 */
+	last = (struct ptp_msg *)k_fifo_peek_tail(&foreign->messages);
+	if (last) {
 		diff = ptp_msg_announce_cmp(&msg->announce, &last->announce);
 	}
+
+	ptp_msg_ref(msg);
+	foreign->messages_count++;
+	k_fifo_put(&foreign->messages, (void *)msg);
 
 	return (foreign->messages_count == FOREIGN_TIME_TRANSMITTER_THRESHOLD ? 1 : 0) || diff;
 }
@@ -1489,6 +1536,8 @@ void ptp_port_free_foreign_tts(struct ptp_port *port)
 int ptp_port_update_current_time_transmitter(struct ptp_port *port, struct ptp_msg *msg)
 {
 	struct ptp_foreign_tt_clock *foreign = port->best;
+	struct ptp_msg *last;
+	int diff = 0;
 
 	if (!foreign ||
 	    !ptp_port_id_eq(&msg->header.src_port_id, &foreign->dataset.sender)) {
@@ -1496,8 +1545,14 @@ int ptp_port_update_current_time_transmitter(struct ptp_port *port, struct ptp_m
 	}
 
 	foreign_clock_cleanup(foreign);
-	ptp_msg_ref(msg);
 
+	/* Before queueing this one; see ptp_port_add_foreign_tt(). */
+	last = (struct ptp_msg *)k_fifo_peek_tail(&foreign->messages);
+	if (last) {
+		diff = ptp_msg_announce_cmp(&msg->announce, &last->announce);
+	}
+
+	ptp_msg_ref(msg);
 	k_fifo_put(&foreign->messages, (void *)msg);
 	foreign->messages_count++;
 
@@ -1506,13 +1561,7 @@ int ptp_port_update_current_time_transmitter(struct ptp_port *port, struct ptp_m
 				      1,
 				      port->port_ds.log_announce_interval);
 
-	if (foreign->messages_count > 1) {
-		struct ptp_msg *last = (struct ptp_msg *)k_fifo_peek_tail(&foreign->messages);
-
-		return ptp_msg_announce_cmp(&msg->announce, &last->announce);
-	}
-
-	return 0;
+	return diff;
 }
 
 int ptp_port_management_msg_process(struct ptp_port *port,
