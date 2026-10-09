@@ -158,37 +158,73 @@ static bool eth_get_ptp_data(struct net_if *iface, struct net_pkt *pkt)
 }
 
 
+/*
+ * Only a timestamped frame carries its packet as the frame context, and
+ * eth_nxp_enet_tx() takes a reference for it before the frame is queued,
+ * so the packet is still valid here and this reference is ours to drop.
+ *
+ * Every other frame has a NULL context. The SDK records a context for
+ * every frame, so passing the packet for all of them left a pointer to a
+ * packet nobody held: by the time its TX completion arrived, the packet
+ * could have been freed and its memory reused by a new one. The check
+ * this replaced, atomic_ref > 0, passes for such a reused packet, so the
+ * handler read a packet that might not be built yet and dropped a
+ * reference it had never taken. Seen as a bus fault in this handler, and
+ * a reference dropped on a live packet frees it early.
+ */
 static inline void ts_register_tx_event(const struct device *dev,
 					 enet_frame_info_t *frameinfo)
 {
+	const struct nxp_enet_mac_config *config = dev->config;
 	struct nxp_enet_mac_data *data = dev->data;
 	struct net_pkt *pkt = frameinfo->context;
+	struct net_ptp_time now;
 
-	if (pkt && atomic_get(&pkt->atomic_ref) > 0) {
-		if ((eth_get_ptp_data(net_pkt_iface(pkt), pkt) ||
-		     net_pkt_is_tx_timestamping(pkt)) &&
-		    frameinfo->isTsAvail) {
-			/* Timestamp is written to packet in ISR.
-			 * Semaphore ensures sequential execution of writing
-			 * the timestamp here and subsequently reading the timestamp
-			 * after waiting for the semaphore in eth_wait_for_ptp_ts().
-			 */
-
-			pkt->timestamp.nanosecond = frameinfo->timeStamp.nanosecond;
-			pkt->timestamp.second = frameinfo->timeStamp.second;
-
-			net_if_add_tx_timestamp(pkt);
-			k_sem_give(&data->ptp.ptp_ts_sem);
-		}
-		net_pkt_unref(pkt);
+	if (pkt == NULL) {
+		return;
 	}
+
+	if (frameinfo->isTsAvail) {
+		/* Timestamp is written to packet in ISR.
+		 * Semaphore ensures sequential execution of writing
+		 * the timestamp here and subsequently reading the timestamp
+		 * after waiting for the semaphore in eth_wait_for_ptp_ts().
+		 */
+
+		/* The descriptor holds only nanoseconds, and the SDK adds the
+		 * seconds counter as it is at reclaim, not at transmit. A
+		 * frame sent just before a second boundary and reclaimed
+		 * after the timer wrap was handled is stamped a second late,
+		 * and one reclaimed after the wrap but before it was handled
+		 * a second early. Take the seconds from the current time
+		 * instead, which accounts for a pending wrap, as the receive
+		 * path does: a frame timestamp ahead of the current
+		 * nanoseconds was taken in the previous second.
+		 */
+		ptp_clock_get(config->ptp_clock, &now);
+		if (now.nanosecond < frameinfo->timeStamp.nanosecond) {
+			now.second--;
+		}
+
+		pkt->timestamp.nanosecond = frameinfo->timeStamp.nanosecond;
+		pkt->timestamp.second = now.second;
+
+		net_if_add_tx_timestamp(pkt);
+	}
+
+	/* Release the sender even without a timestamp, which it would
+	 * otherwise wait for forever.
+	 */
+	k_sem_give(&data->ptp.ptp_ts_sem);
+	net_pkt_unref(pkt);
 }
 
 static inline void eth_wait_for_ptp_ts(const struct device *dev, struct net_pkt *pkt)
 {
 	struct nxp_enet_mac_data *data = dev->data;
 
-	net_pkt_ref(pkt);
+	ARG_UNUSED(pkt);
+
 	while (k_sem_take(&data->ptp.ptp_ts_sem, K_MSEC(200)) != 0) {
 		LOG_ERR("error on take PTP semaphore");
 	}
@@ -227,11 +263,24 @@ static int eth_nxp_enet_tx(const struct device *dev, struct net_pkt *pkt)
 	frame_is_timestamped =
 		eth_get_ptp_data(net_pkt_iface(pkt), pkt) || net_pkt_is_tx_timestamping(pkt);
 
+	/*
+	 * Take the TX completion's reference before the frame is queued: the
+	 * completion can run before ENET_SendFrame() returns, and taking it
+	 * afterwards let that completion drop the caller's reference and
+	 * free the packet first. See ts_register_tx_event().
+	 */
+	if (frame_is_timestamped) {
+		net_pkt_ref(pkt);
+	}
+
 	ret = ENET_SendFrame(data->base, &data->enet_handle, data->tx_frame_buf, total_len, RING_ID,
-			     frame_is_timestamped, pkt);
+			     frame_is_timestamped, frame_is_timestamped ? pkt : NULL);
 
 	if (ret != kStatus_Success) {
 		LOG_ERR("ENET_SendFrame error: %d", ret);
+		if (frame_is_timestamped) {
+			net_pkt_unref(pkt);
+		}
 		ENET_ReclaimTxDescriptor(data->base, &data->enet_handle, RING_ID);
 		return -EIO;
 	}
