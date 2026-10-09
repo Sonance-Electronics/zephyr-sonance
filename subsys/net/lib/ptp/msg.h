@@ -290,7 +290,14 @@ struct ptp_msg {
 		struct net_ptp_time protocol;
 		 /** Ingress timestamp on the host side. */
 		struct net_ptp_time host;
-
+		/** For a sent Delay_Req, set once @ref host holds its egress timestamp. */
+		bool host_is_egress;
+		/**
+		 * For a sent Delay_Req, the uptime in milliseconds it was sent
+		 * at, used to age out requests that are never answered. Kept
+		 * apart from @ref host, which is in the PTP clock's time base.
+		 */
+		int64_t sent_ms;
 	} timestamp;
 	/** Reference counter. */
 	atomic_t ref;
