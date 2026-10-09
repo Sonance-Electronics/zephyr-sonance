@@ -77,7 +77,23 @@ typedef enum {
 	AUDIO_PROPERTY_OUTPUT_VOLUME, /**< Output volume */
 	AUDIO_PROPERTY_OUTPUT_MUTE,   /**< Output mute/unmute */
 	AUDIO_PROPERTY_INPUT_VOLUME,  /**< Input volume */
-	AUDIO_PROPERTY_INPUT_MUTE     /**< Input mute/unmute */
+	AUDIO_PROPERTY_INPUT_MUTE,    /**< Input mute/unmute */
+
+	/**
+	 * Number of all common codec properties.
+	 */
+	AUDIO_PROPERTY_COMMON_COUNT,
+
+	/**
+	 * This and higher values are codec specific.
+	 * Refer to the codec's header file.
+	 */
+	AUDIO_PROPERTY_PRIV_START = AUDIO_PROPERTY_COMMON_COUNT,
+
+	/**
+	 * Maximum value describing a codec property.
+	 */
+	AUDIO_PROPERTY_MAX = INT16_MAX
 } audio_property_t;
 
 /**
