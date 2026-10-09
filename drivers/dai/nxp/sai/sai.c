@@ -200,11 +200,10 @@ static bool sai_fifo_error(const struct device *dev, enum dai_dir dir, bool *hal
  * the error twice, and report the direction to the error callback as not
  * halted.
  *
- * Thread code updates TCSR/RCSR with unlocked read-modify-writes, so one
- * that the halt interrupted can set the error interrupt enable back.
- * sai_tx_rx_csr_update() never writes the write-1-to-clear flags back, so
- * the held flag survives, and the interrupt fires again at once;
- * sai_fifo_error() then finds the direction halted and masks it again.
+ * Thread code updates TCSR/RCSR through sai_tx_rx_csr_update(), and START's
+ * HAL enable, with interrupts locked, so no read-modify-write can set the
+ * error interrupt enable back behind a halt. sai_fifo_error() also masks a
+ * halted direction again, whatever calls it.
  *
  * A stopped direction has the interrupt masked too. STOP turns its DMA
  * requests off before the transmitter/receiver goes down at the end of the
@@ -991,6 +990,7 @@ static int sai_trigger_start(const struct device *dev,
 	struct sai_data *data;
 	const struct sai_config *cfg;
 	uint32_t old_state, dirs;
+	unsigned int key;
 	bool reset;
 	int ret, i;
 
@@ -1086,7 +1086,13 @@ out_enable_dline:
 			*sai_csr_off(data, d) = 0U;
 		}
 	}
+	/* the HAL enable is a read-modify-write of both directions' registers
+	 * in synchronous mode; lock it against the FIFO error ISR, as in
+	 * sai_tx_rx_csr_update()
+	 */
+	key = irq_lock();
 	SAI_TX_RX_ENABLE_DISABLE(dir, data->regmap, true);
+	irq_unlock(key);
 
 	/* update the software state of TX/RX */
 	sai_tx_rx_sw_enable_disable(dir, data, true);
