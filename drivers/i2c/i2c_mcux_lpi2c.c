@@ -62,6 +62,13 @@ struct mcux_lpi2c_data {
 	struct k_sem lock;
 	struct k_sem device_sync_sem;
 	status_t callback_status;
+	uint32_t bitrate_hz;
+#if CONFIG_I2C_MCUX_LPI2C_TRANSFER_TIMEOUT_MS > 0
+	/* ISR entries in a row in which the transfer made no progress. */
+	uint32_t isr_stalls;
+	uint8_t last_state;
+	size_t last_remaining;
+#endif
 #ifdef CONFIG_I2C_TARGET
 	lpi2c_slave_handle_t target_handle;
 	struct i2c_target_config *target_cfg;
@@ -115,6 +122,7 @@ static int mcux_lpi2c_configure(const struct device *dev,
 	}
 
 	LPI2C_MasterSetBaudRate(base, clock_freq, baudrate);
+	data->bitrate_hz = baudrate;
 	k_sem_give(&data->lock);
 
 	return 0;
@@ -142,6 +150,99 @@ static uint32_t mcux_lpi2c_convert_flags(int msg_flags)
 	}
 
 	return flags;
+}
+
+#if CONFIG_I2C_MCUX_LPI2C_TRANSFER_TIMEOUT_MS > 0
+#define MCUX_LPI2C_TRANSFER_TIMEOUT K_MSEC(CONFIG_I2C_MCUX_LPI2C_TRANSFER_TIMEOUT_MS)
+/*
+ * ISR entries without progress before the ISR gives up on a transfer; a few
+ * milliseconds of continuous interrupts on a 600-1000 MHz core. A STOP that
+ * completes normally takes a handful of entries at 100 kHz.
+ */
+#define MCUX_LPI2C_ISR_STALL_LIMIT 10000U
+#else
+#define MCUX_LPI2C_TRANSFER_TIMEOUT K_FOREVER
+#endif
+
+#if CONFIG_I2C_MCUX_LPI2C_BUS_RECOVERY
+static int mcux_lpi2c_recover_bus_locked(const struct device *dev);
+#endif
+
+/*
+ * Put the controller back in the state init left it in. A transfer that
+ * stalls can leave the controller busy and its stop-detect interrupt
+ * enabled with the flag set, so the ISR runs continuously; a reset clears
+ * all of it.
+ */
+static void mcux_lpi2c_reinit_controller(const struct device *dev)
+{
+	const struct mcux_lpi2c_config *config = dev->config;
+	struct mcux_lpi2c_data *data = dev->data;
+	LPI2C_Type *base = (LPI2C_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
+	lpi2c_master_config_t master_config;
+	uint32_t clock_freq;
+
+	if (clock_control_get_rate(config->clock_dev, config->clock_subsys, &clock_freq)) {
+		LOG_ERR("could not get clock rate to reinitialise");
+		return;
+	}
+
+	LPI2C_MasterGetDefaultConfig(&master_config);
+	master_config.busIdleTimeout_ns = config->bus_idle_timeout_ns;
+	master_config.baudRate_Hz = data->bitrate_hz;
+	LPI2C_MasterInit(base, &master_config, clock_freq);
+}
+
+/*
+ * A stuck bus is usually a target that lost bit sync and is holding SDA low,
+ * waiting for clocks the controller will never send. Mid-transfer that shows
+ * as a transfer that never completes; between transfers, as a bus that stays
+ * busy so the next transfer is refused. Abort any transfer, clock the target
+ * free if recovery GPIOs are available, and reset the controller.
+ */
+static void mcux_lpi2c_recover_stuck_bus(const struct device *dev, const char *why)
+{
+	struct mcux_lpi2c_data *data = dev->data;
+	LPI2C_Type *base = (LPI2C_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
+
+	LOG_WRN_RATELIMIT("%s (MSR 0x%08x), recovering", why, base->MSR);
+
+	LPI2C_MasterTransferAbort(base, &data->handle);
+
+#if CONFIG_I2C_MCUX_LPI2C_BUS_RECOVERY
+	const struct mcux_lpi2c_config *config = dev->config;
+
+	if (config->scl.port != NULL && config->sda.port != NULL) {
+		(void)mcux_lpi2c_recover_bus_locked(dev);
+	}
+#endif
+
+	mcux_lpi2c_reinit_controller(dev);
+}
+
+/*
+ * Abort a failed transfer, then recover the bus if it is still busy once the
+ * abort's STOP has had time to go out. The recovery only happens with
+ * stuck-bus handling enabled: another controller on the bus would also look
+ * busy.
+ */
+static void mcux_lpi2c_abort_transfer(const struct device *dev, const char *why)
+{
+	const struct mcux_lpi2c_config *config = dev->config;
+	struct mcux_lpi2c_data *data = dev->data;
+	LPI2C_Type *base = (LPI2C_Type *)DEVICE_MMIO_NAMED_GET(dev, reg_base);
+
+	LPI2C_MasterTransferAbort(base, &data->handle);
+
+	if (CONFIG_I2C_MCUX_LPI2C_TRANSFER_TIMEOUT_MS == 0) {
+		return;
+	}
+
+	k_busy_wait(SCAN_DELAY_US(config->bitrate));
+
+	if ((LPI2C_MasterGetStatusFlags(base) & kLPI2C_MasterBusBusyFlag) != 0U) {
+		mcux_lpi2c_recover_stuck_bus(dev, why);
+	}
 }
 
 static int mcux_lpi2c_transfer(const struct device *dev, struct i2c_msg *msgs,
@@ -186,6 +287,12 @@ static int mcux_lpi2c_transfer(const struct device *dev, struct i2c_msg *msgs,
 		transfer.data = msgs->buf;
 		transfer.dataSize = msgs->len;
 
+		/* Drop a completion left over from a transfer that timed out. */
+		k_sem_reset(&data->device_sync_sem);
+#if CONFIG_I2C_MCUX_LPI2C_TRANSFER_TIMEOUT_MS > 0
+		data->isr_stalls = 0U;
+#endif
+
 		/* Start the transfer */
 		status = LPI2C_MasterTransferNonBlocking(base,
 				&data->handle, &transfer);
@@ -194,19 +301,23 @@ static int mcux_lpi2c_transfer(const struct device *dev, struct i2c_msg *msgs,
 		 * e.g., if the bus was busy
 		 */
 		if (status != kStatus_Success) {
-			LPI2C_MasterTransferAbort(base, &data->handle);
+			mcux_lpi2c_abort_transfer(dev, "bus busy at start");
 			ret = -EIO;
 			break;
 		}
 
 		/* Wait for the transfer to complete */
-		k_sem_take(&data->device_sync_sem, K_FOREVER);
+		if (k_sem_take(&data->device_sync_sem, MCUX_LPI2C_TRANSFER_TIMEOUT) != 0) {
+			mcux_lpi2c_recover_stuck_bus(dev, "transfer timed out");
+			ret = -ETIMEDOUT;
+			break;
+		}
 
 		/* Return an error if the transfer didn't complete
 		 * successfully. e.g., nak, timeout, lost arbitration
 		 */
 		if (data->callback_status != kStatus_Success) {
-			LPI2C_MasterTransferAbort(base, &data->handle);
+			mcux_lpi2c_abort_transfer(dev, "bus busy after error");
 			ret = -EIO;
 			break;
 		}
@@ -251,10 +362,10 @@ static int mcux_lpi2c_bitbang_get_sda(void *io_context)
 	return gpio_pin_get_dt(&config->sda) == 0 ? 0 : 1;
 }
 
-static int mcux_lpi2c_recover_bus(const struct device *dev)
+/* Caller holds data->lock. */
+static int mcux_lpi2c_recover_bus_locked(const struct device *dev)
 {
 	const struct mcux_lpi2c_config *config = dev->config;
-	struct mcux_lpi2c_data *data = dev->data;
 	struct i2c_bitbang bitbang_ctx;
 	struct i2c_bitbang_io bitbang_io = {
 		.set_scl = mcux_lpi2c_bitbang_set_scl,
@@ -273,8 +384,6 @@ static int mcux_lpi2c_recover_bus(const struct device *dev)
 		LOG_ERR("SDA GPIO device not ready");
 		return -EIO;
 	}
-
-	k_sem_take(&data->lock, K_FOREVER);
 
 	error = gpio_pin_configure_dt(&config->scl, GPIO_OUTPUT_HIGH);
 	if (error != 0) {
@@ -306,6 +415,16 @@ static int mcux_lpi2c_recover_bus(const struct device *dev)
 restore:
 	(void)pinctrl_apply_state(config->pincfg, PINCTRL_STATE_DEFAULT);
 
+	return error;
+}
+
+static int mcux_lpi2c_recover_bus(const struct device *dev)
+{
+	struct mcux_lpi2c_data *data = dev->data;
+	int error;
+
+	k_sem_take(&data->lock, K_FOREVER);
+	error = mcux_lpi2c_recover_bus_locked(dev);
 	k_sem_give(&data->lock);
 
 	return error;
@@ -480,6 +599,15 @@ static int mcux_lpi2c_target_unregister(const struct device *dev,
 #define LPI2C_IRQHANDLE_ARG base
 #endif
 
+/* Give up on the transfer from the ISR; the waiting thread sees the status. */
+static void mcux_lpi2c_fail_transfer(LPI2C_Type *base, struct mcux_lpi2c_data *data,
+				     status_t status)
+{
+	LPI2C_MasterTransferAbort(base, &data->handle);
+	data->callback_status = status;
+	k_sem_give(&data->device_sync_sem);
+}
+
 static void mcux_lpi2c_isr(const struct device *dev)
 {
 	struct mcux_lpi2c_data *data = dev->data;
@@ -492,6 +620,47 @@ static void mcux_lpi2c_isr(const struct device *dev)
 #endif /* CONFIG_I2C_TARGET */
 
 	LPI2C_MasterTransferHandleIRQ(LPI2C_IRQHANDLE_ARG, &data->handle);
+
+	/*
+	 * A STOP on the bus while the transfer still has bytes to move is a
+	 * bus error: a glitch, or another device. The SDK only looks at the
+	 * stop-detect flag once it has queued its own STOP, so otherwise the
+	 * flag stays set with its interrupt enabled and this ISR is entered
+	 * continuously, starving every thread, including the one that would
+	 * time the transfer out. A transfer start clears the flag, so it
+	 * cannot be left over from an earlier transfer. State 0 is the SDK's
+	 * idle state.
+	 */
+	if (data->handle.state != 0U && data->handle.remainingBytes > 0U &&
+	    (LPI2C_MasterGetStatusFlags(base) & kLPI2C_MasterStopDetectFlag) != 0U) {
+		mcux_lpi2c_fail_transfer(base, data, kStatus_Fail);
+		return;
+	}
+
+#if CONFIG_I2C_MCUX_LPI2C_TRANSFER_TIMEOUT_MS > 0
+	/*
+	 * The SDK leaves interrupts enabled whose flags only clear when the
+	 * bus moves on: waiting for its STOP, for one, it keeps the transmit
+	 * interrupt enabled with the FIFO empty. If a target holds SDA low,
+	 * the bus never moves on and this ISR is entered continuously. It
+	 * runs at a higher priority than the thread waiting on the transfer
+	 * and than other peripherals' interrupts, so the transfer timeout may
+	 * never get to run. Give up on the transfer here instead; the waiting
+	 * thread sees the error and recovers the bus.
+	 */
+	if (data->handle.state == 0U) {
+		return;
+	}
+
+	if (data->handle.state != data->last_state ||
+	    data->handle.remainingBytes != data->last_remaining) {
+		data->last_state = data->handle.state;
+		data->last_remaining = data->handle.remainingBytes;
+		data->isr_stalls = 0U;
+	} else if (++data->isr_stalls >= MCUX_LPI2C_ISR_STALL_LIMIT) {
+		mcux_lpi2c_fail_transfer(base, data, kStatus_LPI2C_Timeout);
+	}
+#endif
 }
 
 static int mcux_lpi2c_suspend(const struct device *dev)

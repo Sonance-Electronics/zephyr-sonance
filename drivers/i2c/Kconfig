@@ -238,6 +238,20 @@ config I2C_MCUX_LPI2C_BUS_RECOVERY
 	help
 	  Enable LPI2C driver bus recovery support via GPIO bitbanging.
 
+config I2C_MCUX_LPI2C_TRANSFER_TIMEOUT_MS
+	int "Transfer timeout (ms)"
+	depends on I2C_MCUX_LPI2C
+	default 0
+	help
+	  Maximum time for each message of a transfer. A message that takes
+	  longer fails with -ETIMEDOUT, and the controller is reset after
+	  recovering the bus (if I2C_MCUX_LPI2C_BUS_RECOVERY is enabled).
+
+	  A non-zero value also treats a bus that is busy when a transfer
+	  starts as stuck. Do not use it with another controller on the bus.
+
+	  0 waits forever.
+
 config I2C_IMX
 	bool "i.MX I2C driver"
 	default y
