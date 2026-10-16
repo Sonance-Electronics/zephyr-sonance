@@ -1110,6 +1110,18 @@
 				 */
 				status = "disabled";
 			};
+
+			/*
+			 * The die temperature sensor is reached through the
+			 * analog AI bridge (controlled from ANADIG_TEMPSENSOR
+			 * and ANADIG_MISC), not mapped onto the bus, so the
+			 * node has no reg.
+			 */
+			tmpsns: tmpsns {
+				compatible = "nxp,tmpsns";
+				interrupts = <83 0>;
+				status = "disabled";
+			};
 		};
 
 		edma0: dma-controller@40070000 {
