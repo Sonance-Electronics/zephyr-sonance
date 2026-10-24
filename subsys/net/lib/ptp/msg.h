@@ -291,7 +291,8 @@ struct ptp_msg {
 		struct net_ptp_time protocol;
 		 /** Ingress timestamp on the host side. */
 		struct net_ptp_time host;
-
+		/** For a sent Delay_Req, set once @ref host holds its egress timestamp. */
+		bool host_is_egress;
 	} timestamp;
 	/** Reference counter. */
 	atomic_t ref;

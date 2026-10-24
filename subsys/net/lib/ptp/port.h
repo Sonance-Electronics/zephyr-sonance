@@ -80,6 +80,11 @@ struct ptp_port {
 	sys_slist_t		       foreign_list;
 	/** List of valid sent Delay_Req messages (in network byte order). */
 	sys_slist_t		       delay_req_list;
+	/**
+	 * Protects delay_req_list, which the TX timestamp callback updates
+	 * from another thread.
+	 */
+	struct k_spinlock	       delay_req_lock;
 	/** Pointer to the last valid sent Pdelay_Req message. */
 	struct ptp_msg		       *last_pdelay_req_sent;
 	/** Pointer to the last received Pdelay_Req waiting for response TX timestamp. */

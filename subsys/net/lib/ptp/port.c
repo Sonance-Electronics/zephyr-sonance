@@ -420,7 +420,10 @@ static void port_delay_req_timestamp_cb(struct net_pkt *pkt)
 {
 	struct ptp_port *port = ptp_clock_port_from_iface(pkt->iface);
 	struct ptp_msg *req, *msg = ptp_msg_from_pkt(pkt);
-	sys_snode_t *iter, *last = NULL;
+	struct ptp_msg *invalid = NULL;
+	sys_snode_t *prev = NULL;
+	bool unregister = false;
+	k_spinlock_key_t key;
 
 	if (!port || !msg) {
 		return;
@@ -433,35 +436,42 @@ static void port_delay_req_timestamp_cb(struct net_pkt *pkt)
 		return;
 	}
 
-	for (iter = sys_slist_peek_head(&port->delay_req_list);
-	     iter;
-	     iter = sys_slist_peek_next(iter), last = iter) {
+	key = k_spin_lock(&port->delay_req_lock);
 
-		req =  CONTAINER_OF(iter, struct ptp_msg, node);
-
-		if (req->header.sequence_id != msg->header.sequence_id) {
-			continue;
+	SYS_SLIST_FOR_EACH_CONTAINER(&port->delay_req_list, req, node) {
+		if (req->header.sequence_id == msg->header.sequence_id) {
+			break;
 		}
+		prev = &req->node;
+	}
 
-		if (pkt->timestamp.second == UINT64_MAX ||
-		    (pkt->timestamp.second == 0 && pkt->timestamp.nanosecond == 0)) {
-			net_if_unregister_timestamp_cb(&port->delay_req_ts_cb);
-			sys_slist_remove(&port->delay_req_list, last, iter);
-			ptp_msg_unref(req);
-			return;
-		}
-
+	if (req == NULL) {
+		/* Already answered, aged out or cleared. */
+	} else if (pkt->timestamp.second == UINT64_MAX ||
+		   (pkt->timestamp.second == 0 && pkt->timestamp.nanosecond == 0)) {
+		sys_slist_remove(&port->delay_req_list, prev, &req->node);
+		invalid = req;
+		unregister = true;
+	} else {
 		req->timestamp.host._sec.high = pkt->timestamp._sec.high;
 		req->timestamp.host._sec.low = pkt->timestamp._sec.low;
 		req->timestamp.host.nanosecond = pkt->timestamp.nanosecond;
+		req->timestamp.host_is_egress = true;
+		unregister = &req->node == sys_slist_peek_tail(&port->delay_req_list);
+	}
 
+	k_spin_unlock(&port->delay_req_lock, key);
+
+	/* Both take other locks, so neither is done under ours. */
+	if (unregister) {
+		net_if_unregister_timestamp_cb(&port->delay_req_ts_cb);
+	}
+	if (invalid) {
+		ptp_msg_unref(invalid);
+	} else if (req) {
 		LOG_DBG("Port %d registered timestamp for %d Delay_Req",
 			port->port_ds.id.port_number,
 			net_ntohs(msg->header.sequence_id));
-
-		if (iter == sys_slist_peek_tail(&port->delay_req_list)) {
-			net_if_unregister_timestamp_cb(&port->delay_req_ts_cb);
-		}
 	}
 }
 
@@ -724,6 +734,7 @@ static int port_delay_req_msg_transmit(struct ptp_port *port)
 {
 	const struct ptp_default_ds *dds = ptp_clock_default_ds();
 	struct ptp_msg *msg = ptp_msg_alloc();
+	k_spinlock_key_t key;
 	int ret;
 
 	if (!msg) {
@@ -745,15 +756,19 @@ static int port_delay_req_msg_transmit(struct ptp_port *port)
 	if (IS_ENABLED(CONFIG_PTP_IEEE_802_3_PROTOCOL)) {
 		const struct device *phc = net_eth_get_ptp_clock(port->iface);
 
-		if (!phc || ptp_clock_get(phc, &msg->timestamp.host)) {
-			int64_t current = k_uptime_get();
-
-			msg->timestamp.host.second = (uint64_t)(current / MSEC_PER_SEC);
-			msg->timestamp.host.nanosecond = (current % MSEC_PER_SEC) * NSEC_PER_MSEC;
+		/* A PHC read just before the send stands in for the egress timestamp
+		 * here; without a PHC the request has none until the TX timestamp
+		 * callback stores it.
+		 */
+		if (phc && !ptp_clock_get(phc, &msg->timestamp.host)) {
+			msg->timestamp.host_is_egress = true;
 		}
 	}
 
+	key = k_spin_lock(&port->delay_req_lock);
 	sys_slist_append(&port->delay_req_list, &msg->node);
+	k_spin_unlock(&port->delay_req_lock, key);
+
 	if (port_hybrid_delay_req_prepare(port, msg)) {
 		ret = port_msg_sendto(port, msg, PTP_SOCKET_EVENT);
 		if (ret >= 0) {
@@ -763,7 +778,9 @@ static int port_delay_req_msg_transmit(struct ptp_port *port)
 		ret = port_msg_send(port, msg, PTP_SOCKET_EVENT);
 	}
 	if (ret < 0) {
+		key = k_spin_lock(&port->delay_req_lock);
 		sys_slist_find_and_remove(&port->delay_req_list, &msg->node);
+		k_spin_unlock(&port->delay_req_lock, key);
 		ptp_msg_unref(msg);
 		return -EFAULT;
 	}
@@ -938,36 +955,58 @@ static void port_clear_foreign_clock_records(struct ptp_foreign_tt_clock *foreig
 	}
 }
 
+static void port_delay_req_list_unref(sys_slist_t *list)
+{
+	struct ptp_msg *msg, *tmp;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(list, msg, tmp, node) {
+		ptp_msg_unref(msg);
+	}
+}
+
+/*
+ * Free Delay_Reqs that were never answered. Requests are appended as sent, so
+ * the oldest are at the head. The messages are released after the lock is
+ * dropped.
+ */
 static void port_delay_req_cleanup(struct ptp_port *port)
 {
-	struct ptp_msg *msg;
 	int64_t age, current = k_uptime_get();
+	sys_slist_t expired;
+	struct ptp_msg *msg;
+	k_spinlock_key_t key;
 
-	while (!sys_slist_is_empty(&port->delay_req_list)) {
-		msg = CONTAINER_OF(sys_slist_peek_head(&port->delay_req_list), struct ptp_msg,
-				   node);
+	sys_slist_init(&expired);
 
+	key = k_spin_lock(&port->delay_req_lock);
+
+	while ((msg = SYS_SLIST_PEEK_HEAD_CONTAINER(&port->delay_req_list, msg, node)) != NULL) {
 		age = (current - msg->local_uptime_ms) * NSEC_PER_MSEC;
 
 		if (age < PORT_DELAY_REQ_CLEAR_TO) {
 			break;
 		}
 
-		(void)sys_slist_get(&port->delay_req_list);
-		ptp_msg_unref(msg);
+		sys_slist_get_not_empty(&port->delay_req_list);
+		sys_slist_append(&expired, &msg->node);
 	}
+
+	k_spin_unlock(&port->delay_req_lock, key);
+
+	port_delay_req_list_unref(&expired);
 }
 
 static void port_clear_delay_req(struct ptp_port *port)
 {
-	sys_snode_t *prev = NULL;
-	struct ptp_msg *msg;
+	sys_slist_t cleared;
+	k_spinlock_key_t key;
 
-	SYS_SLIST_FOR_EACH_CONTAINER(&port->delay_req_list, msg, node) {
-		ptp_msg_unref(msg);
-		sys_slist_remove(&port->delay_req_list, prev, &msg->node);
-		prev = &msg->node;
-	}
+	key = k_spin_lock(&port->delay_req_lock);
+	cleared = port->delay_req_list;
+	sys_slist_init(&port->delay_req_list);
+	k_spin_unlock(&port->delay_req_lock, key);
+
+	port_delay_req_list_unref(&cleared);
 }
 
 static void port_sync_fup_ooo_handle(struct ptp_port *port, struct ptp_msg *msg)
@@ -1218,6 +1257,7 @@ static void port_delay_resp_msg_process(struct ptp_port *port, struct ptp_msg *m
 	uint64_t t3, t4, t4c;
 	sys_snode_t *prev = NULL;
 	struct ptp_msg *req;
+	k_spinlock_key_t key;
 	enum ptp_port_state state = ptp_port_state(port);
 
 	if (port->port_ds.delay_mechanism != PTP_DM_E2E) {
@@ -1233,6 +1273,8 @@ static void port_delay_resp_msg_process(struct ptp_port *port, struct ptp_msg *m
 		return;
 	}
 
+	key = k_spin_lock(&port->delay_req_lock);
+
 	SYS_SLIST_FOR_EACH_CONTAINER(&port->delay_req_list, req, node) {
 		if (msg->header.sequence_id == net_ntohs(req->header.sequence_id)) {
 			break;
@@ -1240,17 +1282,25 @@ static void port_delay_resp_msg_process(struct ptp_port *port, struct ptp_msg *m
 		prev = &req->node;
 	}
 
-	if (!req) {
+	if (!req || !req->timestamp.host_is_egress) {
+		/* Not a request of ours, or the TX timestamp callback hasn't stored the
+		 * egress timestamp yet (it runs on another thread). Using the request
+		 * as it is would take a placeholder for t3; the entry ages out instead.
+		 */
+		k_spin_unlock(&port->delay_req_lock, key);
 		return;
 	}
 
 	t3 = req->timestamp.host.second * NSEC_PER_SEC + req->timestamp.host.nanosecond;
+	sys_slist_remove(&port->delay_req_list, prev, &req->node);
+
+	k_spin_unlock(&port->delay_req_lock, key);
+
 	t4 = msg->timestamp.protocol.second * NSEC_PER_SEC + msg->timestamp.protocol.nanosecond;
 	t4c = t4 - (msg->header.correction >> 16);
 
 	ptp_clock_delay(t3, t4c);
 
-	sys_slist_remove(&port->delay_req_list, prev, &req->node);
 	ptp_msg_unref(req);
 
 	port_hybrid_delay_resp_received(port);
