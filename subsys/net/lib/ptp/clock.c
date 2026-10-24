@@ -397,6 +397,19 @@ struct zsock_pollfd *ptp_clock_poll_sockets(void)
 	return &ptp_clk.pollfd[1];
 }
 
+/*
+ * Forget the timestamps taken against the previous parent: paired with the new
+ * parent's they would give a nonsense path delay. ptp_clock_delay() then waits
+ * for a Sync from the new parent, as it does at startup. mean_delay and the
+ * servo's frequency estimate are kept: they are still the best available guess
+ * and are replaced by the first new measurements, and clearing the delay would
+ * leave the servo blind until a Delay_Resp arrives.
+ */
+static void clock_sync_reset(void)
+{
+	memset(&ptp_clk.timestamp, 0, sizeof(ptp_clk.timestamp));
+}
+
 void ptp_clock_handle_state_decision_evt(void)
 {
 	struct ptp_foreign_tt_clock *best = NULL, *foreign;
@@ -428,6 +441,10 @@ void ptp_clock_handle_state_decision_evt(void)
 	ptp_clk.best = best;
 	tt_changed = best != NULL && ptp_clk.selected_tt.valid &&
 		     !clock_selected_tt_matches(best);
+	if (tt_changed) {
+		LOG_DBG("Time transmitter changed, forgetting the previous parent's timestamps");
+		clock_sync_reset();
+	}
 
 	SYS_SLIST_FOR_EACH_CONTAINER(&ptp_clk.ports_list, port, node) {
 		enum ptp_port_state state;

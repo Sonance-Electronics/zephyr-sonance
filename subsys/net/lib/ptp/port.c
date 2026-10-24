@@ -1009,6 +1009,19 @@ static void port_clear_delay_req(struct ptp_port *port)
 	port_delay_req_list_unref(&cleared);
 }
 
+/* Drop a Sync awaiting its Follow_Up, or the reverse, and the outstanding
+ * Delay_Reqs, when what they measure no longer applies.
+ */
+static void port_clear_sync(struct ptp_port *port)
+{
+	if (port->last_sync_fup) {
+		ptp_msg_unref(port->last_sync_fup);
+		port->last_sync_fup = NULL;
+	}
+
+	port_clear_delay_req(port);
+}
+
 static void port_sync_fup_ooo_handle(struct ptp_port *port, struct ptp_msg *msg)
 {
 	struct ptp_msg *last = port->last_sync_fup;
@@ -1270,6 +1283,14 @@ static void port_delay_resp_msg_process(struct ptp_port *port, struct ptp_msg *m
 
 	if (!ptp_port_id_eq(&msg->delay_resp.req_port_id, &port->port_ds.id)) {
 		/* Message is not meant for this PTP Port */
+		return;
+	}
+
+	/* As for Sync and Follow_Up. Delay_Req is multicast, so after a parent
+	 * change the previous parent, if still a time transmitter, answers too,
+	 * with a t4 from its own clock.
+	 */
+	if (!ptp_msg_current_parent(msg)) {
 		return;
 	}
 
@@ -1993,6 +2014,29 @@ void ptp_port_event_handle(struct ptp_port *port, enum ptp_port_event event, boo
 		return;
 	}
 
+	/* The state machine acts on tt_diff only through UNCALIBRATED, which is
+	 * optional and not selected here, so do what that state does for a
+	 * port that stays a time receiver.
+	 */
+	if (tt_diff) {
+		port_clear_sync(port);
+		port_pdelay_clear_exchange(port);
+		port_hybrid_tt_addr_invalidate(port);
+
+		/* The Sync receipt timer was armed by the previous parent's last
+		 * Sync, for announce_receipt_timeout of that parent's Sync
+		 * intervals. A new parent that syncs less often cannot get its
+		 * first Sync in before it fires, which drops the new parent's
+		 * records and reverts to the old one, indefinitely. Give the new
+		 * parent an Announce receipt timeout instead; its first Sync
+		 * re-arms the timer for its own interval.
+		 */
+		atomic_clear_bit(&port->timeouts, PTP_PORT_TIMER_SYNC_TO);
+		port_timer_set_timeout(&port->timers.sync,
+				       port->port_ds.announce_receipt_timeout,
+				       port->port_ds.log_announce_interval);
+	}
+
 	if (!port_state_update(port, event, tt_diff)) {
 		/* No PTP Port state change */
 		return;
@@ -2037,11 +2081,7 @@ void ptp_port_event_handle(struct ptp_port *port, enum ptp_port_event event, boo
 					      port->port_ds.log_announce_interval);
 		break;
 	case PTP_PS_UNCALIBRATED:
-		if (port->last_sync_fup) {
-			ptp_msg_unref(port->last_sync_fup);
-			port->last_sync_fup = NULL;
-		}
-		port_clear_delay_req(port);
+		port_clear_sync(port);
 		port_pdelay_clear_exchange(port);
 		port_hybrid_tt_addr_invalidate(port);
 		__fallthrough;
