@@ -36,6 +36,11 @@ LOG_MODULE_REGISTER(ptp_clock, CONFIG_PTP_LOG_LEVEL);
 #define MAX_NSEC_TO_TIMEINTERVAL (0x00007FFFFFFFFFFFULL)
 #define INGRESS_TS_PHC_DELTA_GUARD_NS (5ULL * NSEC_PER_SEC)
 
+/* A mean path delay at or beyond this, either way, is not a measurement but a
+ * timestamp off by a second or more, see ptp_clock_delay().
+ */
+#define MAX_PLAUSIBLE_DELAY_NS ((int64_t)NSEC_PER_SEC / 4)
+
 /*
  * Servo acquisition policy:
  * - offsets above the step threshold are corrected by setting the clock; until
@@ -849,7 +854,12 @@ void ptp_clock_delay(uint64_t egress, uint64_t ingress)
 		 (int64_t)(ptp_clk.timestamp.t4 - ptp_clk.timestamp.t1)) /
 		2LL;
 
-	if (llabs(delay) > (int64_t)NSEC_PER_SEC) {
+	/* A timestamp a second out, as after a clock step or from a seconds field
+	 * wrong at a second boundary, moves the mean by half a second, and the
+	 * true delay is added to that: +0.5 s lands beyond a half-second limit,
+	 * -0.5 s just inside it. A quarter second leaves room for any real path.
+	 */
+	if (delay >= MAX_PLAUSIBLE_DELAY_NS || delay <= -MAX_PLAUSIBLE_DELAY_NS) {
 		LOG_WRN("Ignoring unrealistic delay sample: %lldns", delay);
 		return;
 	}
