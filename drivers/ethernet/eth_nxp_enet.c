@@ -188,7 +188,7 @@ static inline void eth_wait_for_ptp_ts(const struct device *dev, struct net_pkt 
 {
 	struct nxp_enet_mac_data *data = dev->data;
 
-	net_pkt_ref(pkt);
+	ARG_UNUSED(pkt);
 	while (k_sem_take(&data->ptp.ptp_ts_sem, K_MSEC(200)) != 0) {
 		LOG_ERR("error on take PTP semaphore");
 	}
@@ -227,11 +227,26 @@ static int eth_nxp_enet_tx(const struct device *dev, struct net_pkt *pkt)
 	frame_is_timestamped =
 		eth_get_ptp_data(net_pkt_iface(pkt), pkt) || net_pkt_is_tx_timestamping(pkt);
 
-	ret = ENET_SendFrame(data->base, &data->enet_handle, data->tx_frame_buf, total_len, RING_ID,
-			     frame_is_timestamped, pkt);
+       /*
+        * The HAL hands the frame context back to the TX completion callback
+        * for every frame, and ts_register_tx_event() dereferences and unrefs
+        * it. Only a timestamped frame keeps its packet alive until then: any
+        * other is freed by the stack as soon as this returns, so passing it
+        * would have the interrupt read, and unref, a packet that may already
+        * have been reallocated. Take the reference before the frame can
+        * complete, not after.
+        */
+        if (frame_is_timestamped) {
+                net_pkt_ref(pkt);
+        }
 
+	ret = ENET_SendFrame(data->base, &data->enet_handle, data->tx_frame_buf, total_len, RING_ID,
+			     frame_is_timestamped, frame_is_timestamped ? pkt : NULL);
 	if (ret != kStatus_Success) {
 		LOG_ERR("ENET_SendFrame error: %d", ret);
+                if (frame_is_timestamped) {
+                        net_pkt_unref(pkt);
+                }
 		ENET_ReclaimTxDescriptor(data->base, &data->enet_handle, RING_ID);
 		return -EIO;
 	}
