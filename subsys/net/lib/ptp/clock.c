@@ -703,6 +703,16 @@ void ptp_clock_synchronize(uint64_t ingress, uint64_t egress)
 
 		LOG_WRN("Clock offset exceeds 1 second.");
 
+		/* The clock keeps running between the read and the write, so
+		 * any time spent in between is lost from the new setting. A
+		 * preemptible PTP thread could lose milliseconds here to a
+		 * higher priority thread, which the servo then has to remove
+		 * with rate corrections. Locking the scheduler bounds the
+		 * window to interrupt latency, as for a cooperative thread,
+		 * and unlike irq_lock() still allows a driver that sleeps.
+		 */
+		k_sched_lock();
+
 		ptp_clock_get(ptp_clk.phc, &current);
 
 		current.second = (uint64_t)(current.second - (offset / NSEC_PER_SEC));
@@ -719,6 +729,9 @@ void ptp_clock_synchronize(uint64_t ingress, uint64_t egress)
 		current.nanosecond = (uint32_t)dest_nsec;
 
 		ptp_clock_set(ptp_clk.phc, &current);
+
+		k_sched_unlock();
+
 		LOG_WRN("Set clock time: %"PRIu64".%09u", current.second, current.nanosecond);
 
 		/* t2 is in the time base just replaced. Pairing it with a t3
