@@ -115,7 +115,13 @@ enum ptp_port_state ptp_state_machine(enum ptp_port_state state,
 		}
 		break;
 #endif /* CONFIG_PTP_PRE_TIME_TRANSMITTER_PRESENT */
+	/* GRAND_MASTER shares the TIME_TRANSMITTER case: without it, a port
+	 * that enters GRAND_MASTER can never leave -- BMCA recommendations to
+	 * yield to a better master fall into the default case and the port
+	 * masters forever (backport of the upstream fix).
+	 */
 	case PTP_PS_TIME_TRANSMITTER:
+	case PTP_PS_GRAND_MASTER:
 		switch (event) {
 		case PTP_EVT_DESIGNATED_DISABLED:
 			new_state = IS_ENABLED(CONFIG_PTP_DISABLED_PRESENT) ?
