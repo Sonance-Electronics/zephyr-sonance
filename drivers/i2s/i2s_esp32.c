@@ -18,6 +18,9 @@
 #include <esp_clk_tree.h>
 #include <esp_private/esp_clk_tree_common.h>
 #include <hal/i2s_hal.h>
+#if defined(CONFIG_I2S_ESP32_CLK_SRC_APLL)
+#include <hal/clk_tree_ll.h>
+#endif
 
 #if !SOC_GDMA_SUPPORTED
 #include <soc/lldesc.h>
@@ -40,7 +43,12 @@ LOG_MODULE_REGISTER(i2s_esp32, CONFIG_I2S_LOG_LEVEL);
  * alias of a module clock, so its rate resolves to zero. PLL_F160M is
  * available on the revisions zephyr supports.
  */
-#ifdef CONFIG_SOC_SERIES_ESP32P4
+#if defined(CONFIG_I2S_ESP32_CLK_SRC_APLL)
+#if !SOC_I2S_SUPPORTS_APLL
+#error "CONFIG_I2S_ESP32_CLK_SRC_APLL: this SoC's I2S cannot use the APLL"
+#endif
+#define I2S_ESP32_CLK_SRC I2S_CLK_SRC_APLL
+#elif defined(CONFIG_SOC_SERIES_ESP32P4)
 #define I2S_ESP32_CLK_SRC I2S_CLK_SRC_PLL_160M
 #else
 #define I2S_ESP32_CLK_SRC I2S_CLK_SRC_DEFAULT
@@ -123,6 +131,37 @@ uint32_t i2s_esp32_get_source_clk_freq(i2s_clock_src_t clk_src)
 	return clk_freq;
 }
 
+#if defined(CONFIG_I2S_ESP32_CLK_SRC_APLL)
+/*
+ * Set the APLL to a multiple of mclk_hz, at least twice it (the MCLK divider
+ * divides by two even when set to one) and at least the APLL's minimum, and
+ * return the frequency it runs at, or 0. If another user holds the APLL at a
+ * different frequency, that frequency is kept and returned.
+ */
+static uint32_t i2s_esp32_set_apll_freq(uint32_t mclk_hz, uint32_t *div)
+{
+	uint32_t real_hz = 0;
+	esp_err_t err;
+
+	*div = MAX(CLK_LL_APLL_MIN_HZ / mclk_hz + 1U, 2U);
+	if ((uint64_t)mclk_hz * *div > CLK_LL_APLL_MAX_HZ) {
+		LOG_ERR("MCLK %u Hz needs an APLL above its maximum", mclk_hz);
+		return 0;
+	}
+
+	err = esp_clk_tree_src_set_freq_hz(SOC_MOD_CLK_APLL, mclk_hz * *div, &real_hz);
+	if (err == ESP_ERR_INVALID_STATE) {
+		LOG_WRN("APLL already in use at %u Hz, not %u Hz", real_hz, mclk_hz * *div);
+		*div = MAX((real_hz + mclk_hz / 2U) / mclk_hz, 2U);
+	} else if (err != ESP_OK) {
+		LOG_ERR("APLL set to %u Hz failed: %d", mclk_hz * *div, err);
+		return 0;
+	}
+
+	return real_hz;
+}
+#endif /* CONFIG_I2S_ESP32_CLK_SRC_APLL */
+
 static esp_err_t i2s_esp32_calculate_clock(const struct i2s_config *i2s_cfg, uint8_t channel_length,
 					   i2s_hal_clock_info_t *i2s_hal_clock_info)
 {
@@ -153,7 +192,18 @@ static esp_err_t i2s_esp32_calculate_clock(const struct i2s_config *i2s_cfg, uin
 		i2s_hal_clock_info->bclk_div = i2s_hal_clock_info->mclk / i2s_hal_clock_info->bclk;
 	}
 
+#if defined(CONFIG_I2S_ESP32_CLK_SRC_APLL)
+	uint32_t apll_div;
+
+	i2s_hal_clock_info->sclk = i2s_esp32_set_apll_freq(i2s_hal_clock_info->mclk, &apll_div);
+	if (i2s_hal_clock_info->sclk == 0) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	/* What the APLL actually makes, so the MCLK divider stays an integer */
+	i2s_hal_clock_info->mclk = i2s_hal_clock_info->sclk / apll_div;
+#else
 	i2s_hal_clock_info->sclk = i2s_esp32_get_source_clk_freq(I2S_ESP32_CLK_SRC);
+#endif
 	i2s_hal_clock_info->mclk_div = i2s_hal_clock_info->sclk / i2s_hal_clock_info->mclk;
 	if (i2s_hal_clock_info->mclk_div == 0) {
 		LOG_DBG("Sample rate is too large for the current clock source");

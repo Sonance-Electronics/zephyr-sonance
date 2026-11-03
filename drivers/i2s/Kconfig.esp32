@@ -12,6 +12,30 @@ config I2S_ESP32
 
 if I2S_ESP32
 
+choice I2S_ESP32_CLK_SRC
+	prompt "ESP32 I2S clock source"
+	default I2S_ESP32_CLK_SRC_DEFAULT
+
+config I2S_ESP32_CLK_SRC_DEFAULT
+	bool "Default clock source of the SoC"
+	help
+	  The SoC's default I2S clock source; on ESP32-P4 the 160 MHz PLL.
+	  The MCLK divider is fractional unless the PLL is a multiple of
+	  MCLK.
+
+config I2S_ESP32_CLK_SRC_APLL
+	bool "Audio PLL"
+	depends on SOC_SERIES_ESP32P4
+	help
+	  Clock I2S from the audio PLL, set at configure time to a multiple
+	  of MCLK (at least twice MCLK, and at least the APLL's minimum
+	  frequency) so the MCLK divider is an integer. The APLL is shared
+	  with other peripherals: if another user already set it, I2S runs
+	  from its current frequency, and audio rates that need a different
+	  one come out wrong.
+
+endchoice
+
 config I2S_ESP32_RX_BLOCK_COUNT
 	int "ESP32 I2S RX block count"
 	default 5
