@@ -209,6 +209,24 @@ static inline bool dma_ll_tx_is_fsm_idle(struct dma_esp32_data *data, int ch)
 	return ahb_dma_ll_tx_is_desc_fsm_idle(data->hal.ahb_dma_dev, ch);
 }
 
+/*
+ * Whether a TX transfer is still running. Here the descriptor FSM parks as
+ * soon as it has fetched the descriptor it works on, while the data FSM
+ * goes on moving the data, so the park bit alone reads idle through most
+ * of a transfer. Running means either FSM is not idle.
+ */
+static inline bool dma_ll_tx_is_running(struct dma_esp32_data *data, int ch)
+{
+	if (data->is_axi) {
+		return !axi_dma_ll_tx_is_desc_fsm_idle(data->hal.axi_dma_dev, ch) ||
+		       data->hal.axi_dma_dev->out[ch].conf.out_state.out_dscr_state_chn != 0 ||
+		       data->hal.axi_dma_dev->out[ch].conf.out_state.out_state_chn != 0;
+	}
+	return !ahb_dma_ll_tx_is_desc_fsm_idle(data->hal.ahb_dma_dev, ch) ||
+	       data->hal.ahb_dma_dev->channel[ch].out.out_state.out_dscr_state_chn != 0 ||
+	       data->hal.ahb_dma_dev->channel[ch].out.out_state.out_state_chn != 0;
+}
+
 static inline intptr_t dma_ll_rx_get_prefetched_desc(struct dma_esp32_data *data, int ch)
 {
 	if (data->is_axi) {
@@ -252,6 +270,11 @@ static inline bool dma_ll_rx_is_fsm_idle(struct dma_esp32_data *data, int ch)
 static inline bool dma_ll_tx_is_fsm_idle(struct dma_esp32_data *data, int ch)
 {
 	return gdma_ll_tx_is_desc_fsm_idle(data->hal.dev, ch);
+}
+
+static inline bool dma_ll_tx_is_running(struct dma_esp32_data *data, int ch)
+{
+	return !gdma_ll_tx_is_desc_fsm_idle(data->hal.dev, ch);
 }
 
 static inline intptr_t dma_ll_rx_get_prefetched_desc(struct dma_esp32_data *data, int ch)
@@ -1008,7 +1031,7 @@ static int dma_esp32_start(const struct device *dev, uint32_t channel)
 						 GDMA_CHANNEL_DIRECTION_RX,
 						 (intptr_t)dma_channel->desc_list);
 		} else if (dma_channel->dir == DMA_TX) {
-			if (!dma_ll_tx_is_fsm_idle(data, dma_channel->channel_id)) {
+			if (dma_ll_tx_is_running(data, dma_channel->channel_id)) {
 				return 0; /* already running, the reload is linked behind */
 			}
 			gdma_hal_enable_intr(&data->hal, dma_channel->channel_id,
@@ -1127,7 +1150,7 @@ static int IRAM_ATTR dma_esp32_get_status(const struct device *dev, uint32_t cha
 				dma_channel->desc_list[0].dw0.size * status->read_position;
 		}
 	} else if (dma_channel->dir == DMA_TX) {
-		status->busy = !dma_ll_tx_is_fsm_idle(data, dma_channel->channel_id);
+		status->busy = dma_ll_tx_is_running(data, dma_channel->channel_id);
 		status->dir = MEMORY_TO_PERIPHERAL;
 		desc = (esp_dma_desc_t *)dma_ll_tx_get_prefetched_desc(data,
 								       dma_channel->channel_id);
@@ -1245,7 +1268,7 @@ static int dma_esp32_reload(const struct device *dev, uint32_t channel, uint32_t
 
 	/* A running TX channel takes the buffer as the next one, as with eDMA. */
 	if (dma_channel->dir == DMA_TX && dma_channel->periph_id != SOC_GDMA_TRIG_PERIPH_M2M0 &&
-	    dma_channel->tail != NULL && !dma_ll_tx_is_fsm_idle(data, dma_channel->channel_id)) {
+	    dma_channel->tail != NULL && dma_ll_tx_is_running(data, dma_channel->channel_id)) {
 		return dma_esp32_tx_append(data, dma_channel, src, size);
 	}
 
