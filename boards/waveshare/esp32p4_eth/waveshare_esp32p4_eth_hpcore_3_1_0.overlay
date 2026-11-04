@@ -1,0 +1,24 @@
+/*
+ * SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* Boards carrying v3.x silicon. Keep in sync with esp32p4_rev3.dtsi. */
+
+&cpus {
+	riscv,isa-extensions = "i", "m", "a", "f", "c", "zicsr", "zifencei",
+			       "zba", "zbb", "zbs", "zcb";
+};
+
+/*
+ * v3.x silicon's valid CPU frequencies are 100/200/400 MHz. Using a
+ * frequency outside that set builds but fails at boot with "invalid CPU
+ * frequency".
+ */
+&cpu0 {
+	clock-frequency = <DT_FREQ_M(400)>;
+};
+
+&cpu1 {
+	clock-frequency = <DT_FREQ_M(400)>;
+};

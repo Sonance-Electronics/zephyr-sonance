@@ -14,17 +14,22 @@ use an additional microcontroller such as an ESP32-C5 as a Wi-Fi/Bluetooth
 interface), therefore this board does NOT have Wi-Fi/Bluetooth. For more
 information, check `ESP32-P4-ETH`_.
 
-This board ships with ESP32-P4 silicon revision v1.3 (a pre-v3 part), and the
-Zephyr board configuration targets that revision with the HP cores clocked at
-360 MHz. Pre-v3 silicon tops out at 360 MHz; v3.x parts run at up to 400 MHz.
+The board has shipped with ESP32-P4 silicon revision v1.3 (a pre-v3 part) and
+with v3.x parts. The default board revision, ``1.3.0``, targets v1.3 with the
+HP cores clocked at 360 MHz, the most pre-v3 silicon supports. Build for v3.x
+silicon with board revision ``3.1.0`` (for example
+``waveshare_esp32p4_eth@3.1.0/esp32p4/hpcore``), which clocks the HP cores at
+400 MHz. An image built for one revision does not boot on the other. esptool
+reports the silicon revision when flashing ("Chip type: ESP32-P4 (revision
+v3.2)").
 
 Hardware
 ********
 
 ESP32-P4-ETH ships with:
 
-- ESP32-P4NRW32 SoC (silicon revision v1.3) with 32 MB PSRAM stacked in the
-  package, paired with 32 MB of on-board NOR flash
+- ESP32-P4NRW32 SoC (silicon revision v1.3 or v3.x) with 32 MB PSRAM stacked
+  in the package, paired with 32 MB of on-board NOR flash
 - USB-C connector wired to a USB-to-UART bridge, accessing the ROM bootloader
   and console
 - Additional USB header for native USB OTG 2.0 HS
