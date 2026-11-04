@@ -42,6 +42,15 @@ config I2S_ESP32_RX_BLOCK_COUNT
 	help
 	  Max number of blocks waiting to be read from the I2S RX channel.
 
+config I2S_ESP32_RX_BLOCK_HOOK
+	bool "Call i2s_esp32_rx_block_done() as each received block completes"
+	help
+	  Calls i2s_esp32_rx_block_done() from the DMA completion interrupt
+	  as each received block is queued for i2s_read(), so that an
+	  application can tell when the block's last sample arrived, for
+	  example to timestamp it. i2s_read() only says when the block was
+	  taken, which can be any time after that.
+
 config I2S_ESP32_TX_BLOCK_COUNT
 	int "ESP32 I2S TX block count"
 	default 5

@@ -7,6 +7,7 @@
 #define DT_DRV_COMPAT espressif_esp32_i2s
 
 #include <zephyr/drivers/i2s.h>
+#include <zephyr/drivers/i2s/i2s_esp32.h>
 #include <zephyr/drivers/dma.h>
 #include <zephyr/drivers/dma/dma_esp32.h>
 #include <zephyr/drivers/clock_control.h>
@@ -338,6 +339,10 @@ static void IRAM_ATTR i2s_esp32_rx_callback(void *arg, int status)
 	}
 #endif /* SOC_GDMA_SUPPORTED */
 
+	if (IS_ENABLED(CONFIG_I2S_ESP32_RX_BLOCK_HOOK)) {
+		i2s_esp32_rx_block_done(dev, stream->data->mem_block);
+	}
+
 	struct queue_item item = {
 		.buffer = stream->data->mem_block,
 		.size = stream->data->mem_block_len
@@ -389,6 +394,14 @@ static void IRAM_ATTR i2s_esp32_rx_callback(void *arg, int status)
 rx_disable:
 	i2s_esp32_rx_stop_transfer(dev);
 }
+
+#ifdef CONFIG_I2S_ESP32_RX_BLOCK_HOOK
+__weak void IRAM_ATTR i2s_esp32_rx_block_done(const struct device *dev, void *mem_block)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(mem_block);
+}
+#endif /* CONFIG_I2S_ESP32_RX_BLOCK_HOOK */
 
 #if !SOC_GDMA_SUPPORTED
 
