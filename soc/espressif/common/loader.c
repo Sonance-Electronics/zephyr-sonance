@@ -364,6 +364,23 @@ static void boot_start(void)
 /* Entered from start.S, which has set up gp, the stack and the vector table. */
 void start_riscv(void)
 {
+#if defined(CONFIG_SOC_SERIES_ESP32P4)
+	/*
+	 * The ROM hands over with the L2 cache at its reset size of 256 KB,
+	 * but the image is linked for CONFIG_ESP32_CACHE_L2_SIZE. Below v3.0
+	 * the cache takes the top of HP SRAM, so 256 KB starts at 0x4ff80000
+	 * and covers RAM the linker gives to .bss; clearing .bss there hangs
+	 * the CPU. Set the configured size first. hardware_init() sets it
+	 * again along with the rest of the cache.
+	 */
+	Cache_Set_L2_Cache_Mode(IS_ENABLED(CONFIG_ESP32_CACHE_L2_128KB)   ? CACHE_SIZE_128K
+				: IS_ENABLED(CONFIG_ESP32_CACHE_L2_256KB) ? CACHE_SIZE_256K
+									  : CACHE_SIZE_512K,
+				CACHE_8WAYS_ASSOC,
+				IS_ENABLED(CONFIG_ESP32_CACHE_L2_LINE_64B) ? CACHE_LINE_SIZE_64B
+									   : CACHE_LINE_SIZE_128B);
+	Cache_Invalidate_All(CACHE_MAP_L2_CACHE);
+#endif
 	arch_bss_zero();
 
 	boot_start();
