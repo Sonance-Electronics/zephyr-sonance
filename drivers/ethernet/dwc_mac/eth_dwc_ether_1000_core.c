@@ -388,6 +388,13 @@ static void dwmac_rx_refill(const struct device *dev)
 		return;
 	}
 
+	/*
+	 * Write back and drop any cached lines of the buffer before the DMA
+	 * owns it: a dirty line left from its previous use could otherwise be
+	 * evicted over the frame the DMA writes.
+	 */
+	sys_cache_data_flush_and_invd_range(frag->data, frag->size);
+
 	K_SPINLOCK(&p->spinlock) {
 		dwmac_rx_refill_desc(dev, frag);
 	}
