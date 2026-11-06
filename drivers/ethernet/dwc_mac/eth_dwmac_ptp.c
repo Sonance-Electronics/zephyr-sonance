@@ -196,6 +196,9 @@ static int dwmac_ptp_init(const struct device *dev)
 		if (IS_ENABLED(CONFIG_PTP_UDP_IPV6_PROTOCOL)) {
 			ctrl |= BIT(12);
 		}
+		if (IS_ENABLED(CONFIG_PTP_CLOCK_DWC_MAC_RX_TIMESTAMP_ALL)) {
+			ctrl |= DWMAC_PTP_CTRL_ALL_RX;
+		}
 	} else {
 		/* Enable timestamping for all received packets */
 		ctrl |= DWMAC_PTP_CTRL_ALL_RX;

@@ -9,3 +9,13 @@ config PTP_CLOCK_DWC_MAC
 	select NET_L2_PTP_TIMESTAMPING
 	help
 	  Enable PTP clock support for the Synopsys DesignWare MAC cores.
+
+config PTP_CLOCK_DWC_MAC_RX_TIMESTAMP_ALL
+	bool "Timestamp every received frame"
+	depends on PTP_CLOCK_DWC_MAC && PTP
+	help
+	  With the PTP stack enabled, only PTP frames get a receive
+	  timestamp. This also stamps every other frame, so applications can
+	  read a received packet's arrival time at the MAC (for example
+	  through SO_TIMESTAMPING) to measure network latency. PTP is
+	  unaffected: its frames are stamped either way.
