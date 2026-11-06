@@ -38,6 +38,74 @@ DWMAC_ASSERT_BUFFER_ALIGNMENT(DATA_BUS_WIDTH);
 
 PINCTRL_DT_INST_DEFINE(0);
 
+static intr_handle_t dwmac_intr_handle;
+
+static int dwmac_esp32_alloc_irq(const struct device *dev)
+{
+	return esp_intr_alloc(DT_INST_IRQ_BY_IDX(0, 0, irq),
+			      ESP_PRIO_TO_FLAGS(DT_INST_IRQ_BY_IDX(0, 0, priority)) |
+				      ESP_INT_FLAGS_CHECK(DT_INST_IRQ_BY_IDX(0, 0, flags)),
+			      (intr_handler_t)dwmac_isr, (void *)(uintptr_t)dev,
+			      &dwmac_intr_handle);
+}
+
+#if defined(CONFIG_ETH_ESP32_DWC_ETHER_1000_IRQ_CPU) && CONFIG_ETH_ESP32_DWC_ETHER_1000_IRQ_CPU != 0
+
+static K_THREAD_STACK_DEFINE(dwmac_irq_move_stack, 1024);
+static struct k_thread dwmac_irq_move_thread;
+static int dwmac_irq_move_ret;
+
+static void dwmac_irq_move(void *arg1, void *unused1, void *unused2)
+{
+	const struct device *dev = arg1;
+
+	ARG_UNUSED(unused1);
+	ARG_UNUSED(unused2);
+
+	dwmac_irq_move_ret = dwmac_esp32_alloc_irq(dev);
+}
+
+static int dwmac_esp32_irq_to_cpu(void)
+{
+	const struct device *dev = DEVICE_DT_INST_GET(0);
+	k_tid_t tid;
+
+	if (!device_is_ready(dev) || dwmac_intr_handle == NULL) {
+		return 0;
+	}
+
+	/*
+	 * Free it on the CPU that allocated it, then allocate it again on the
+	 * target. Status bits that latch in between stay set in DMASR, so the
+	 * interrupt fires as soon as it is enabled again.
+	 */
+	if (esp_intr_free(dwmac_intr_handle) != 0) {
+		LOG_ERR("Failed to free the interrupt");
+		return -EIO;
+	}
+	dwmac_intr_handle = NULL;
+
+	tid = k_thread_create(&dwmac_irq_move_thread, dwmac_irq_move_stack,
+			      K_THREAD_STACK_SIZEOF(dwmac_irq_move_stack), dwmac_irq_move,
+			      (void *)dev, NULL, NULL, K_HIGHEST_THREAD_PRIO, 0, K_FOREVER);
+	k_thread_cpu_pin(tid, CONFIG_ETH_ESP32_DWC_ETHER_1000_IRQ_CPU);
+	k_thread_start(tid);
+	k_thread_join(tid, K_FOREVER);
+
+	if (dwmac_irq_move_ret != 0) {
+		LOG_ERR("Failed to move the interrupt to CPU %d (%d)",
+			CONFIG_ETH_ESP32_DWC_ETHER_1000_IRQ_CPU, dwmac_irq_move_ret);
+		return -EIO;
+	}
+
+	LOG_INF("interrupt on CPU %d", esp_intr_get_cpu(dwmac_intr_handle));
+	return 0;
+}
+
+SYS_INIT(dwmac_esp32_irq_to_cpu, SMP, 0);
+
+#endif /* CONFIG_ETH_ESP32_DWC_ETHER_1000_IRQ_CPU != 0 */
+
 #ifdef CONFIG_SOC_SERIES_ESP32
 #define EMAC_EXT_ADDR (&EMAC_EXT)
 #else
@@ -132,10 +200,7 @@ int dwmac_platform_init(const struct device *dev)
 #endif
 
 	/* Configure ISR */
-	ret = esp_intr_alloc(DT_INST_IRQ_BY_IDX(0, 0, irq),
-			     ESP_PRIO_TO_FLAGS(DT_INST_IRQ_BY_IDX(0, 0, priority)) |
-				     ESP_INT_FLAGS_CHECK(DT_INST_IRQ_BY_IDX(0, 0, flags)),
-			     (intr_handler_t)dwmac_isr, (void *)(uintptr_t)dev, NULL);
+	ret = dwmac_esp32_alloc_irq(dev);
 	if (ret != 0) {
 		return -EIO;
 	}

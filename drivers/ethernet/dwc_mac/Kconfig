@@ -44,6 +44,19 @@ config ETH_ESP32_DWC_ETHER_1000
 	help
 	  This enables the Synopsys DesignWare MAC driver for ESP32 SoCs.
 
+config ETH_ESP32_DWC_ETHER_1000_IRQ_CPU
+	int "CPU that takes the MAC interrupt"
+	depends on ETH_ESP32_DWC_ETHER_1000 && SMP && SCHED_CPU_MASK
+	range 0 1
+	default 0
+	help
+	  The interrupt allocator binds an interrupt to the core that
+	  allocates it, which at driver init is always CPU 0, as the other
+	  core starts after the APPLICATION init level. With a non-zero
+	  value the interrupt is freed and allocated again from a thread
+	  pinned to this CPU at the SMP init level, so receive processing
+	  and transmit reclaim run there.
+
 config ETH_XMC_DWC_ETHER_1000
 	bool "Driver for DWC Ethernet MAC-based XMC4XXX"
 	depends on !ETH_XMC4XXX
