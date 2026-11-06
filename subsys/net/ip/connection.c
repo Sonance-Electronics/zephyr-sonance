@@ -888,7 +888,10 @@ enum net_verdict net_conn_input(struct net_pkt *pkt,
 	struct net_conn *best_match = NULL;
 	int16_t best_rank = -1;
 	bool is_mcast_pkt = false;
-	bool mcast_pkt_delivered = false;
+	/* The last matching connection for a multicast packet, which gets the
+	 * packet itself once the walk is over; each earlier match gets a clone.
+	 */
+	struct net_conn *mcast_last = NULL;
 	bool is_bcast_pkt = false;
 	struct net_conn *conn;
 	net_conn_cb_t cb = NULL;
@@ -994,15 +997,20 @@ enum net_verdict net_conn_input(struct net_pkt *pkt,
 					continue; /* found a match - but maybe not yet the best */
 				}
 
-				/* If we have a multicast packet, and we found
-				 * a match, then deliver the packet immediately
-				 * to the handler. As there might be several
-				 * sockets interested about these, we need to
-				 * clone the received pkt.
+				/* A multicast packet may have several
+				 * recipients. Each match but the last gets a
+				 * clone, delivered as the next match is found;
+				 * the last gets the packet itself after the
+				 * walk, so a single recipient costs no clone.
 				 */
 
 				NET_DBG("[%p] mcast match found cb %p ud %p", conn, conn->cb,
 					conn->user_data);
+
+				if (mcast_last == NULL) {
+					mcast_last = conn;
+					continue;
+				}
 
 				mcast_pkt = net_pkt_clone(
 					pkt, K_MSEC(CONFIG_NET_CONN_PACKET_CLONE_TIMEOUT));
@@ -1011,18 +1019,22 @@ enum net_verdict net_conn_input(struct net_pkt *pkt,
 					goto drop;
 				}
 
-				if (conn->cb(conn, mcast_pkt, ip_hdr, proto_hdr, conn->user_data) ==
-				    NET_DROP) {
+				if (mcast_last->cb(mcast_last, mcast_pkt, ip_hdr, proto_hdr,
+						   mcast_last->user_data) == NET_DROP) {
 					net_stats_update_per_proto_drop(pkt_iface, proto);
 					net_pkt_unref(mcast_pkt);
 				} else {
 					net_stats_update_per_proto_recv(pkt_iface, proto);
 				}
 
-				mcast_pkt_delivered = true;
+				mcast_last = conn;
 			}
 		}
 	} /* loop end */
+
+	if (mcast_last != NULL) {
+		best_match = mcast_last;
+	}
 
 	if (best_match != NULL) {
 		cb = best_match->cb;
@@ -1030,15 +1042,6 @@ enum net_verdict net_conn_input(struct net_pkt *pkt,
 	}
 
 	k_mutex_unlock(&conn_lock);
-
-	if (is_mcast_pkt && mcast_pkt_delivered) {
-		/* As one or more multicast packets
-		 * have already been delivered in the loop above,
-		 * we shall not call the callback again here.
-		 */
-		net_pkt_unref(pkt);
-		return NET_OK;
-	}
 
 	if (cb != NULL) {
 		NET_DBG("[%p] match found cb %p ud %p rank 0x%02x", best_match, cb,
