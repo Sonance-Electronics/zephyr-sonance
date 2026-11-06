@@ -741,9 +741,10 @@ ETH_NET_L3_REGISTER(IPv6, NET_ETH_PTYPE_IPV6, ethernet_ip_recv);
 #if defined(CONFIG_NET_IPV4)
 static inline bool ethernet_ipv4_dst_is_broadcast_or_mcast(struct net_pkt *pkt)
 {
-	if (net_ipv4_is_addr_bcast_raw(net_pkt_iface(pkt),
-				       NET_IPV4_HDR(pkt)->dst) ||
-	    net_ipv4_is_addr_mcast_raw(NET_IPV4_HDR(pkt)->dst)) {
+	/* The multicast test first: the broadcast one takes the interface lock. */
+	if (net_ipv4_is_addr_mcast_raw(NET_IPV4_HDR(pkt)->dst) ||
+	    net_ipv4_is_addr_bcast_raw(net_pkt_iface(pkt),
+				       NET_IPV4_HDR(pkt)->dst)) {
 		return true;
 	}
 

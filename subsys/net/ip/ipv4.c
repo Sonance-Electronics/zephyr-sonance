@@ -442,8 +442,9 @@ enum net_verdict net_ipv4_input(struct net_pkt *pkt)
 		return NET_DROP;
 	}
 
-	if ((!net_ipv4_is_my_addr_raw(hdr->dst) &&
-	     !net_ipv4_is_addr_mcast_raw(hdr->dst) &&
+	/* The multicast test first: the address lookup takes the interface lock. */
+	if ((!net_ipv4_is_addr_mcast_raw(hdr->dst) &&
+	     !net_ipv4_is_my_addr_raw(hdr->dst) &&
 	     !(hdr->proto == NET_IPPROTO_UDP &&
 	       (net_ipv4_addr_cmp_raw(hdr->dst, net_ipv4_broadcast_address()->s4_addr) ||
 		/* RFC 1122 ch. 3.3.6 The 0.0.0.0 is non-standard bcast addr */

@@ -300,8 +300,12 @@ static inline int check_ip(struct net_pkt *pkt)
 		/* If the destination address is our own, then route it
 		 * back to us.
 		 */
+		/* A multicast destination is never our own address; testing
+		 * for it first skips two lookups under the interface lock.
+		 */
 		if (net_ipv4_is_addr_loopback_raw(NET_IPV4_HDR(pkt)->dst) ||
-		    (net_ipv4_is_addr_bcast_raw(net_pkt_iface(pkt),
+		    (!net_ipv4_is_addr_mcast_raw(NET_IPV4_HDR(pkt)->dst) &&
+		     net_ipv4_is_addr_bcast_raw(net_pkt_iface(pkt),
 						NET_IPV4_HDR(pkt)->dst) == false &&
 		     net_ipv4_is_my_addr_raw(NET_IPV4_HDR(pkt)->dst))) {
 			struct net_in_addr addr;
