@@ -239,6 +239,18 @@ void sai_isr(const void *parameter)
 	}
 }
 
+/* enable or disable every interrupt line of the instance */
+static void sai_irqs_enable(const struct sai_config *cfg, bool enable)
+{
+	for (uint8_t i = 0; i < cfg->num_irqs; i++) {
+		if (enable) {
+			irq_enable(cfg->irqs[i]);
+		} else {
+			irq_disable(cfg->irqs[i]);
+		}
+	}
+}
+
 static int sai_config_get(const struct device *dev,
 			  struct dai_config *cfg,
 			  enum dai_dir dir)
@@ -881,7 +893,7 @@ static int sai_trigger_stop(const struct device *dev,
 	other_state = sai_get_state(dir == DAI_DIR_TX ? DAI_DIR_RX : DAI_DIR_TX, data);
 	if (other_state != DAI_STATE_RUNNING && other_state != DAI_STATE_PAUSED &&
 	    other_state != DAI_STATE_ERROR) {
-		irq_disable(cfg->irq);
+		sai_irqs_enable(cfg, false);
 	}
 
 	/* With the SAI providing the bit clock this does not wait. The DMA
@@ -1081,7 +1093,7 @@ out_enable_dline:
 	 * have turned it off while this one was paused, so a resume needs it
 	 * as much as a start does
 	 */
-	irq_enable(cfg->irq);
+	sai_irqs_enable(cfg, true);
 
 	/* enable TX/RX data line. This translates to TX_DLINE0/RX_DLINE0
 	 * being enabled.
@@ -1371,6 +1383,15 @@ static int sai_init(const struct device *dev)
 	return pm_device_runtime_enable(dev);
 }
 
+/* Connect every interrupt line, not only the first: an SAI with separate RX
+ * and TX lines otherwise never sees the other direction's FIFO errors.
+ */
+#define SAI_IRQ_CONNECT(idx, inst)						\
+	IRQ_CONNECT(DT_INST_IRQN_BY_IDX(inst, idx), 0, sai_isr,		\
+		    DEVICE_DT_INST_GET(inst), 0)
+
+#define SAI_IRQN(idx, inst) DT_INST_IRQN_BY_IDX(inst, idx)
+
 #define SAI_INIT(inst)								\
 										\
 PINCTRL_DT_INST_DEFINE(inst);							\
@@ -1409,17 +1430,18 @@ static const struct dai_properties sai_rx_props_##inst = {			\
 										\
 void irq_config_##inst(void)							\
 {										\
-	IRQ_CONNECT(DT_INST_IRQN(inst),						\
-		    0,								\
-		    sai_isr,							\
-		    DEVICE_DT_INST_GET(inst),					\
-		    0);								\
+	LISTIFY(DT_INST_NUM_IRQS(inst), SAI_IRQ_CONNECT, (;), inst);		\
 }										\
+										\
+static const uint32_t sai_irqs_##inst[] = {					\
+	LISTIFY(DT_INST_NUM_IRQS(inst), SAI_IRQN, (,), inst)			\
+};										\
 										\
 static struct sai_config sai_config_##inst = {					\
 	.regmap_phys = DT_INST_REG_ADDR(inst),					\
 	.regmap_size = DT_INST_REG_SIZE(inst),					\
-	.irq = DT_INST_IRQN(inst),						\
+	.irqs = sai_irqs_##inst,						\
+	.num_irqs = ARRAY_SIZE(sai_irqs_##inst),				\
 	.clk_data = SAI_CLOCK_DATA_DECLARE(inst),				\
 	.rx_fifo_watermark = SAI_RX_FIFO_WATERMARK(inst),			\
 	.tx_fifo_watermark = SAI_TX_FIFO_WATERMARK(inst),			\
