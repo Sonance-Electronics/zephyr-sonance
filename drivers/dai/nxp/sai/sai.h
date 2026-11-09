@@ -273,7 +273,13 @@ struct sai_data {
 struct sai_config {
 	uint32_t regmap_phys;
 	uint32_t regmap_size;
-	uint32_t irq;
+	/* Every interrupt line of the instance. Most SAIs have one line for
+	 * both directions; some have separate RX and TX lines. All are
+	 * connected to the same ISR, which checks both directions, and are
+	 * enabled and disabled together.
+	 */
+	const uint32_t *irqs;
+	uint8_t num_irqs;
 	struct sai_clock_data clk_data;
 	bool mclk_is_output;
 	/* if the tx/rx-fifo-watermark properties are not specified, it's going

@@ -61,6 +61,10 @@ properties:
     description: Watermark value (in FIFO words) of TX FIFO.
   interrupts:
     required: true
+    description: |
+      The SAI's interrupt lines: a single line shared by both directions,
+      or, on SAIs that have them, separate receive and transmit lines. All
+      listed lines are connected to the same handler.
   fifo-depth:
     type: int
     description: Size (in FIFO words) of the TX/RX FIFO.
