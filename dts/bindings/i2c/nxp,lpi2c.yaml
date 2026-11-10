@@ -15,6 +15,25 @@ properties:
     type: int
     description: Bus idle timeout in nanoseconds
 
+  scl-glitch-filter-ns:
+    type: int
+    default: 0
+    description: |
+      Width in nanoseconds of the controller's SCL input glitch filter;
+      pulses this short or shorter are ignored. The filter counts cycles
+      of the LPI2C functional clock, up to 15, so the widest it can be is
+      15 cycles of that clock. 0 disables it. Use it where crosstalk puts
+      short pulses on SCL: an unfiltered controller can count one as a
+      clock that a target ignores, and the two then disagree on the bit
+      position.
+
+  sda-glitch-filter-ns:
+    type: int
+    default: 0
+    description: |
+      Width in nanoseconds of the controller's SDA input glitch filter, as
+      for scl-glitch-filter-ns. 0 disables it.
+
   scl-gpios:
     type: phandle-array
     description: |

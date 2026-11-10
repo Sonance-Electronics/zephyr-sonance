@@ -48,6 +48,8 @@ struct mcux_lpi2c_config {
 	void (*irq_config_func)(const struct device *dev);
 	uint32_t bitrate;
 	uint32_t bus_idle_timeout_ns;
+	uint32_t scl_glitch_filter_ns;
+	uint32_t sda_glitch_filter_ns;
 	const struct pinctrl_dev_config *pincfg;
 #ifdef CONFIG_I2C_MCUX_LPI2C_BUS_RECOVERY
 	struct gpio_dt_spec scl;
@@ -318,6 +320,8 @@ static int mcux_lpi2c_init(const struct device *dev)
 
 	LPI2C_MasterGetDefaultConfig(&master_config);
 	master_config.busIdleTimeout_ns = config->bus_idle_timeout_ns;
+	master_config.sclGlitchFilterWidth_ns = config->scl_glitch_filter_ns;
+	master_config.sdaGlitchFilterWidth_ns = config->sda_glitch_filter_ns;
 	LPI2C_MasterInit(base, &master_config, clock_freq);
 	LPI2C_MasterTransferCreateHandle(base, &data->handle,
 					 mcux_lpi2c_master_transfer_callback,
@@ -400,6 +404,8 @@ static DEVICE_API(i2c, mcux_lpi2c_driver_api) = {
 		.bus_idle_timeout_ns =					\
 			UTIL_AND(DT_INST_NODE_HAS_PROP(n, bus_idle_timeout),\
 				 DT_INST_PROP(n, bus_idle_timeout)),	\
+		.scl_glitch_filter_ns = DT_INST_PROP(n, scl_glitch_filter_ns),\
+		.sda_glitch_filter_ns = DT_INST_PROP(n, sda_glitch_filter_ns),\
 	};								\
 									\
 	I2C_RTIO_DEFINE(_i2c##n##_lpi2c_rtio,				\

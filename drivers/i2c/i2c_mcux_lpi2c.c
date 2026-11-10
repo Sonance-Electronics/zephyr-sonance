@@ -49,6 +49,8 @@ struct mcux_lpi2c_config {
 	void (*irq_config_func)(const struct device *dev);
 	uint32_t bitrate;
 	uint32_t bus_idle_timeout_ns;
+	uint32_t scl_glitch_filter_ns;
+	uint32_t sda_glitch_filter_ns;
 	const struct pinctrl_dev_config *pincfg;
 #ifdef CONFIG_I2C_MCUX_LPI2C_BUS_RECOVERY
 	struct gpio_dt_spec scl;
@@ -168,6 +170,16 @@ static uint32_t mcux_lpi2c_convert_flags(int msg_flags)
 static int mcux_lpi2c_recover_bus_locked(const struct device *dev);
 #endif
 
+/* The controller settings from the devicetree, used by init and reinit. */
+static void mcux_lpi2c_master_config(const struct mcux_lpi2c_config *config,
+				     lpi2c_master_config_t *master_config)
+{
+	LPI2C_MasterGetDefaultConfig(master_config);
+	master_config->busIdleTimeout_ns = config->bus_idle_timeout_ns;
+	master_config->sclGlitchFilterWidth_ns = config->scl_glitch_filter_ns;
+	master_config->sdaGlitchFilterWidth_ns = config->sda_glitch_filter_ns;
+}
+
 /*
  * Put the controller back in the state init left it in. A transfer that
  * stalls can leave the controller busy and its stop-detect interrupt
@@ -187,8 +199,7 @@ static void mcux_lpi2c_reinit_controller(const struct device *dev)
 		return;
 	}
 
-	LPI2C_MasterGetDefaultConfig(&master_config);
-	master_config.busIdleTimeout_ns = config->bus_idle_timeout_ns;
+	mcux_lpi2c_master_config(config, &master_config);
 	master_config.baudRate_Hz = data->bitrate_hz;
 	LPI2C_MasterInit(base, &master_config, clock_freq);
 }
@@ -740,8 +751,7 @@ static int mcux_lpi2c_init(const struct device *dev)
 		return -EINVAL;
 	}
 
-	LPI2C_MasterGetDefaultConfig(&master_config);
-	master_config.busIdleTimeout_ns = config->bus_idle_timeout_ns;
+	mcux_lpi2c_master_config(config, &master_config);
 	LPI2C_MasterInit(base, &master_config, clock_freq);
 	LPI2C_MasterTransferCreateHandle(base, &data->handle,
 					 mcux_lpi2c_master_transfer_callback,
@@ -826,6 +836,8 @@ static DEVICE_API(i2c, mcux_lpi2c_driver_api) = {
 		.bus_idle_timeout_ns =					\
 			UTIL_AND(DT_INST_NODE_HAS_PROP(n, bus_idle_timeout),\
 				 DT_INST_PROP(n, bus_idle_timeout)),	\
+		.scl_glitch_filter_ns = DT_INST_PROP(n, scl_glitch_filter_ns),\
+		.sda_glitch_filter_ns = DT_INST_PROP(n, sda_glitch_filter_ns),\
 	};								\
 									\
 	static struct mcux_lpi2c_data mcux_lpi2c_data_##n;		\
