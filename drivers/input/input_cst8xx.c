@@ -94,6 +94,8 @@ struct cst8xx_config {
 #ifdef CONFIG_INPUT_CST8XX_INTERRUPT
 	const struct gpio_dt_spec int_gpio;
 #endif
+	/** Keep the controller out of automatic standby while active. */
+	bool disable_auto_sleep;
 
 #ifdef CONFIG_PM_DEVICE
 	/** cst8xx power management profile. */
@@ -282,6 +284,20 @@ static int cst8xx_chip_init(const struct device *dev)
 		LOG_ERR("Could not enable irq (%d)", ret);
 		return ret;
 	}
+
+	/*
+	 * In automatic standby the controller does not answer I2C until it is
+	 * touched, which a polling read cannot wait for. Any nonzero value
+	 * disables it.
+	 */
+	if (cfg->disable_auto_sleep) {
+		ret = i2c_reg_write_byte_dt(&cfg->i2c, CST8XX_REG_DIS_AUTO_SLEEP, 0x01);
+		if (ret < 0) {
+			LOG_ERR("Could not disable auto sleep (%d)", ret);
+			return ret;
+		}
+	}
+
 	return 0;
 }
 
@@ -419,6 +435,7 @@ static int cst8xx_pm_action(const struct device *dev, enum pm_device_action acti
 	static const struct cst8xx_config cst8xx_config_##index = {                                \
 		.i2c = I2C_DT_SPEC_INST_GET(index),                                                \
 		.rst_gpio = GPIO_DT_SPEC_INST_GET_OR(index, rst_gpios, {}),                        \
+		.disable_auto_sleep = DT_INST_PROP(index, disable_auto_sleep),                     \
 		IF_ENABLED(CONFIG_INPUT_CST8XX_INTERRUPT,                                          \
 				(.int_gpio = GPIO_DT_SPEC_INST_GET(index, irq_gpios),))            \
 				 IF_ENABLED(CONFIG_PM_DEVICE,                                      \

@@ -72,3 +72,12 @@ properties:
     description:
       Time (in seconds) of inactivity after which the controller automatically
       enters standby / low-power mode. The default value is specified in the data sheet.
+
+  disable-auto-sleep:
+    type: boolean
+    description: |
+      Keep the controller out of its automatic standby while the device is
+      active. In standby the controller stops answering I2C until it is
+      touched, so with no irq-gpios, when the driver polls, every read
+      fails from a couple of seconds after the last touch. The suspend
+      power profile turns automatic standby back on.
