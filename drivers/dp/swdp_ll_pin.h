@@ -19,6 +19,11 @@ static ALWAYS_INLINE void pin_delay_asm(uint32_t delay)
 			:
 			: "cc"
 			);
+#elif defined(CONFIG_RISCV)
+	__asm volatile("1:\n"
+		       "addi %0, %0, -1\n"
+		       "bnez %0, 1b\n"
+		       : "+r"(delay));
 #else
 #warning "Pin delay is not defined"
 #endif
