@@ -106,6 +106,20 @@ void dap_link_set_pkt_size(struct dap_link_context *const dap_link_ctx,
 int dap_link_backend_usb_init(struct dap_link_context *const dap_link_ctx);
 
 /**
+ * @brief Initialize the DAP Link TCP backend.
+ *
+ * Starts a thread that accepts one CMSIS-DAP TCP client at a time on
+ * @kconfig{CONFIG_DAP_BACKEND_TCP_PORT}. The wire format is the one used
+ * by the OpenOCD cmsis-dap tcp backend.
+ *
+ * @param[in] dap_link_ctx Context to bind to the TCP backend.
+ *
+ * @retval 0 Successfully initialized the TCP backend.
+ * @retval -EALREADY The TCP backend is already initialized.
+ */
+int dap_link_backend_tcp_init(struct dap_link_context *const dap_link_ctx);
+
+/**
  * @brief Release the debug port held by a context.
  *
  * Several contexts can share one debug port device. The context that
