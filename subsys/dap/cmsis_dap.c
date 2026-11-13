@@ -704,6 +704,15 @@ static uint16_t dap_swdp_transferblock(struct dap_link_context *const ctx,
 	req_buf = request + (sizeof(req_cnt) + sizeof(req_val) + 1);
 	rspns_buf = response + (sizeof(rspns_cnt) + sizeof(rspns_val));
 
+	/*
+	 * Neither the write data nor the read response may exceed one packet:
+	 * command, DAP index, count and request byte, followed by the data.
+	 */
+	if (req_cnt > (ctx->pkt_size - 5U) / sizeof(data)) {
+		LOG_WRN("Transfer block count %u exceeds packet size", req_cnt);
+		req_cnt = (ctx->pkt_size - 5U) / sizeof(data);
+	}
+
 	if (req_cnt == 0U) {
 		goto end;
 	}
