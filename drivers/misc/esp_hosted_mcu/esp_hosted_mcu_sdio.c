@@ -329,6 +329,23 @@ static int esp_hosted_mcu_sdio_init(const struct device *dev)
 	}
 
 	/*
+	 * Enable card interrupts (master enable and Function 1) in the CCCR.
+	 * Without this the coprocessor never asserts DAT1 and every received
+	 * frame waits for the receive poll.
+	 */
+	uint8_t int_en;
+
+	ret = sdio_read_byte(&data->card.func0, SDIO_CCCR_INT_EN, &int_en);
+	if (ret == 0) {
+		int_en |= BIT(0) | BIT(SDIO_FUNC_NUM_1);
+		ret = sdio_write_byte(&data->card.func0, SDIO_CCCR_INT_EN, int_en);
+	}
+	if (ret != 0) {
+		LOG_ERR("card interrupt enable in CCCR failed (%d)", ret);
+		return ret;
+	}
+
+	/*
 	 * Raise the open-data-path interrupt so the coprocessor activates its data
 	 * path and starts serving the FIFO. Without this the coprocessor accepts
 	 * writes into the FIFO but never parses them or emits a response.
