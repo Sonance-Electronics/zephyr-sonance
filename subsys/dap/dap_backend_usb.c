@@ -185,6 +185,7 @@ static void dap_func_disable(struct usbd_class_data *const c_data)
 	struct dap_func_data *data = usbd_class_get_private(c_data);
 
 	atomic_clear_bit(&data->state, SAMPLE_FUNCTION_ENABLED);
+	(void)dap_link_release(data->dap_link_ctx);
 	LOG_INF("Configuration disabled");
 }
 

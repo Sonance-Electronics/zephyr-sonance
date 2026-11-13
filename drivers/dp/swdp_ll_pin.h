@@ -19,6 +19,11 @@ static ALWAYS_INLINE void pin_delay_asm(uint32_t delay)
 			:
 			: "cc"
 			);
+#elif defined(CONFIG_RISCV)
+	__asm volatile("1:\n"
+		       "addi %0, %0, -1\n"
+		       "bnez %0, 1b\n"
+		       : "+r"(delay));
 #else
 #warning "Pin delay is not defined"
 #endif
@@ -35,6 +40,10 @@ static ALWAYS_INLINE void pin_delay_asm(uint32_t delay)
 #elif defined(CONFIG_SOC_FAMILY_MCXA)
 
 #include "swdp_ll_pin_mcx.h"
+
+#elif defined(CONFIG_SOC_SERIES_ESP32P4)
+
+#include "swdp_ll_pin_esp32.h"
 
 #else
 
@@ -63,6 +72,20 @@ static ALWAYS_INLINE uint32_t swdp_ll_pin_get(void *const base, uint8_t pin)
 	return 0UL;
 }
 
+#endif
+
+#ifndef SWDP_LL_HAS_PORT_HOOKS
+/*
+ * Optional hooks for SoCs that switch the SWD pins to a faster access path
+ * while the debug port is on.
+ */
+static ALWAYS_INLINE void swdp_ll_port_attach(void *const base, uint8_t pin, bool output)
+{
+}
+
+static ALWAYS_INLINE void swdp_ll_port_detach(void *const base, uint8_t pin)
+{
+}
 #endif
 
 #ifndef CPU_CLOCK

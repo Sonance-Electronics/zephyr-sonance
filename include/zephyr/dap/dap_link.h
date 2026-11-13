@@ -105,6 +105,46 @@ void dap_link_set_pkt_size(struct dap_link_context *const dap_link_ctx,
  */
 int dap_link_backend_usb_init(struct dap_link_context *const dap_link_ctx);
 
+/**
+ * @brief Initialize the DAP Link TCP backend.
+ *
+ * Starts a thread that accepts one CMSIS-DAP TCP client at a time on
+ * @kconfig{CONFIG_DAP_BACKEND_TCP_PORT}. The wire format is the one used
+ * by the OpenOCD cmsis-dap tcp backend.
+ *
+ * @param[in] dap_link_ctx Context to bind to the TCP backend.
+ *
+ * @retval 0 Successfully initialized the TCP backend.
+ * @retval -EALREADY The TCP backend is already initialized.
+ */
+int dap_link_backend_tcp_init(struct dap_link_context *const dap_link_ctx);
+
+/**
+ * @brief Release the debug port held by a context.
+ *
+ * Several contexts can share one debug port device. The context that
+ * successfully connects the port owns it until it disconnects or is
+ * released. While the port is owned, other contexts can only use the
+ * DAP_Info, DAP_HostStatus and DAP_Disconnect commands; their DAP_Connect
+ * reports the port as disabled and all other commands return DAP_ERROR.
+ *
+ * Backends call this when their host goes away. It may also be used to
+ * force a release.
+ *
+ * @param[in] dap_link_ctx Context that owns the debug port.
+ *
+ * @retval 0 The debug port was released.
+ * @retval -EALREADY The context does not own the debug port.
+ */
+int dap_link_release(struct dap_link_context *const dap_link_ctx);
+
+/**
+ * @brief Get the context that owns the debug port.
+ *
+ * @return Owning context, or NULL if the debug port is free.
+ */
+struct dap_link_context *dap_link_get_owner(void);
+
 #ifdef __cplusplus
 }
 #endif

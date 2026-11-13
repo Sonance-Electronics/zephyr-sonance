@@ -48,8 +48,11 @@ LOG_MODULE_REGISTER(esp_hosted_mcu, CONFIG_WIFI_LOG_LEVEL);
 #define ESP_HOSTED_MCU_WIFI_IF_STA 0
 #define ESP_HOSTED_MCU_WIFI_IF_AP  1
 
-/* SAE PWE derivation: 0=HUNT_AND_PECK, 1=HASH_TO_ELEMENT, 2=BOTH. */
-#define ESP_HOSTED_MCU_SAE_PWE_BOTH 2
+/*
+ * Coprocessor-side wifi_sae_pwe_method_t values (esp_wifi): 0=UNSPECIFIED,
+ * 1=HUNT_AND_PECK, 2=HASH_TO_ELEMENT, 3=BOTH.
+ */
+#define ESP_HOSTED_MCU_SAE_PWE_BOTH 3
 
 /* Coprocessor-side wifi_ps_type_t values (esp_wifi): none, min and max modem. */
 #define ESP_HOSTED_MCU_PS_NONE      0

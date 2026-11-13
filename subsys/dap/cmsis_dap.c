@@ -30,6 +30,15 @@ LOG_MODULE_REGISTER(dap, CONFIG_DAP_LOG_LEVEL);
 
 #define CMSIS_DAP_PACKET_MIN_SIZE 64
 
+/*
+ * Several backends (contexts) may share one debug port device. The lock
+ * serializes whole packets, and the context that connected the port owns
+ * it until it disconnects or its backend releases it. While a port is
+ * owned, other contexts can only query information.
+ */
+static K_MUTEX_DEFINE(dap_link_lock);
+static struct dap_link_context *dap_link_owner;
+
 BUILD_ASSERT(sizeof(CONFIG_CMSIS_DAP_PROBE_VENDOR) <=
 	     MIN(CMSIS_DAP_PACKET_MIN_SIZE - 2, UINT8_MAX - 2),
 	     "PROBE_VENDOR string is too long.");
@@ -211,6 +220,10 @@ static uint16_t dap_connect(struct dap_link_context *const ctx,
 		break;
 	}
 
+	if (port == DAP_PORT_SWD) {
+		dap_link_owner = ctx;
+	}
+
 	response[0] = port;
 	return 1U;
 }
@@ -232,6 +245,10 @@ static uint16_t dap_disconnect(struct dap_link_context *const ctx,
 
 	response[0] = DAP_OK;
 	atomic_clear_bit(&ctx->state, DAP_STATE_CONNECTED);
+
+	if (dap_link_owner == ctx) {
+		dap_link_owner = NULL;
+	}
 
 	return 1;
 }
@@ -687,6 +704,15 @@ static uint16_t dap_swdp_transferblock(struct dap_link_context *const ctx,
 	req_buf = request + (sizeof(req_cnt) + sizeof(req_val) + 1);
 	rspns_buf = response + (sizeof(rspns_cnt) + sizeof(rspns_val));
 
+	/*
+	 * Neither the write data nor the read response may exceed one packet:
+	 * command, DAP index, count and request byte, followed by the data.
+	 */
+	if (req_cnt > (ctx->pkt_size - 5U) / sizeof(data)) {
+		LOG_WRN("Transfer block count %u exceeds packet size", req_cnt);
+		req_cnt = (ctx->pkt_size - 5U) / sizeof(data);
+	}
+
 	if (req_cnt == 0U) {
 		goto end;
 	}
@@ -850,6 +876,24 @@ static uint16_t dap_process_cmd(struct dap_link_context *const ctx,
 
 	LOG_HEXDUMP_DBG(request, 8, "req");
 
+	if (dap_link_owner != NULL && dap_link_owner != ctx) {
+		switch (*request) {
+		case ID_DAP_INFO:
+		case ID_DAP_HOST_STATUS:
+		case ID_DAP_DISCONNECT:
+			break;
+		case ID_DAP_CONNECT:
+			LOG_WRN("Debug port is in use by another backend");
+			response[0] = ID_DAP_CONNECT;
+			response[1] = DAP_PORT_DISABLED;
+			return 2U;
+		default:
+			response[0] = *request;
+			response[1] = DAP_ERROR;
+			return 2U;
+		}
+	}
+
 	if ((*request >= ID_DAP_VENDOR0) && (*request <= ID_DAP_VENDOR31)) {
 		return dap_process_vendor_cmd(ctx, request, response);
 	}
@@ -982,14 +1026,8 @@ static uint16_t dap_process_cmd(struct dap_link_context *const ctx,
 	return (1U + retval);
 }
 
-/*
- * Execute DAP command (process request and prepare response)
- *   request:  pointer to request data
- *   response: pointer to response data
- *   return:   number of bytes in response
- */
-uint32_t dap_link_execute_cmd(struct dap_link_context *const dap_link_ctx,
-			      const uint8_t *request, uint8_t *response)
+static uint32_t dap_link_execute_cmd_locked(struct dap_link_context *const dap_link_ctx,
+					    const uint8_t *request, uint8_t *response)
 {
 	uint32_t retval;
 	uint16_t n;
@@ -1014,6 +1052,58 @@ uint32_t dap_link_execute_cmd(struct dap_link_context *const dap_link_ctx,
 	}
 
 	return dap_process_cmd(dap_link_ctx, request, response);
+}
+
+/*
+ * Execute DAP command (process request and prepare response)
+ *   request:  pointer to request data
+ *   response: pointer to response data
+ *   return:   number of bytes in response
+ */
+uint32_t dap_link_execute_cmd(struct dap_link_context *const dap_link_ctx, const uint8_t *request,
+			      uint8_t *response)
+{
+	uint32_t retval;
+
+	(void)k_mutex_lock(&dap_link_lock, K_FOREVER);
+	retval = dap_link_execute_cmd_locked(dap_link_ctx, request, response);
+	(void)k_mutex_unlock(&dap_link_lock);
+
+	return retval;
+}
+
+int dap_link_release(struct dap_link_context *const dap_link_ctx)
+{
+	int ret = 0;
+
+	(void)k_mutex_lock(&dap_link_lock, K_FOREVER);
+
+	if (dap_link_owner != dap_link_ctx) {
+		ret = -EALREADY;
+	} else {
+		if (atomic_test_and_clear_bit(&dap_link_ctx->state, DAP_STATE_CONNECTED)) {
+			(void)swdp_port_off(dap_link_ctx->dev);
+		}
+
+		dap_link_ctx->debug_port = DAP_PORT_DISABLED;
+		dap_link_owner = NULL;
+		LOG_INF("Debug port released");
+	}
+
+	(void)k_mutex_unlock(&dap_link_lock);
+
+	return ret;
+}
+
+struct dap_link_context *dap_link_get_owner(void)
+{
+	struct dap_link_context *owner;
+
+	(void)k_mutex_lock(&dap_link_lock, K_FOREVER);
+	owner = dap_link_owner;
+	(void)k_mutex_unlock(&dap_link_lock);
+
+	return owner;
 }
 
 void dap_link_set_pkt_size(struct dap_link_context *const dap_link_ctx,
